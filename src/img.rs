@@ -392,11 +392,16 @@ impl RequestContext{
 }
 
 fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:jpegxr::PixelFormat)->Option<DynamicImage>{
+	let buf_len = buffer.len();
+	// Validate minimum buffer size for stride-based formats
+	let required_size = if height > 0 { (height as usize - 1) * stride } else { 0 };
 	match info{
 		jpegxr::PixelFormat::PixelFormat8bppGray => {
 			image::ImageBuffer::from_raw(width,height,buffer).map(|i|DynamicImage::ImageLuma8(i))
 		},
 		jpegxr::PixelFormat::PixelFormat24bppBGR => {
+			let end = required_size + width as usize * 3;
+			if buf_len < end { return None; }
 			let mut rgb=Vec::with_capacity((width*height*3) as usize);
 			for y in 0..height{
 				for x in 0..width{
@@ -412,7 +417,9 @@ fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:jpegxr::Pixe
 			image::ImageBuffer::from_raw(width,height,buffer).map(|i|DynamicImage::ImageRgb8(i))
 		},
 		jpegxr::PixelFormat::PixelFormat32bppBGR => {
-			let mut raw_img=Vec::with_capacity(height as usize*3);
+			let end = required_size + width as usize * 4 + 2;
+			if buf_len < end { return None; }
+			let mut raw_img=Vec::with_capacity((width as usize)*(height as usize)*3);
 			for y in 0..height{
 				for x in 0..width{
 					raw_img.push(buffer[y as usize*stride+x as usize*4+2]);
@@ -423,6 +430,8 @@ fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:jpegxr::Pixe
 			image::ImageBuffer::from_raw(width,height,raw_img).map(|i|DynamicImage::ImageRgb8(i))
 		},
 		jpegxr::PixelFormat::PixelFormat32bppBGRA => {
+			let end = required_size + width as usize * 4 + 2;
+			if buf_len < end { return None; }
 			let mut buffer=buffer;
 			for y in 0..height{
 				for x in 0..width{
@@ -435,7 +444,9 @@ fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:jpegxr::Pixe
 			image::ImageBuffer::from_raw(width,height,buffer).map(|i|DynamicImage::ImageRgba8(i))
 		},
 		jpegxr::PixelFormat::PixelFormat32bppRGB => {
-			let mut raw_img=Vec::with_capacity(height as usize*3);
+			let end = required_size + width as usize * 4 + 2;
+			if buf_len < end { return None; }
+			let mut raw_img=Vec::with_capacity((width as usize)*(height as usize)*3);
 			for y in 0..height{
 				for x in 0..width{
 					raw_img.push(buffer[y as usize*stride+x as usize*4+0]);
