@@ -166,15 +166,15 @@ impl RequestContext{
 						dec.sort_by_time_stamp();
 						for frame in dec.into_iter(){
 							let img=if frame.get_layout().is_alpha() {
-								let image =
-									image::ImageBuffer::from_raw(frame.width(), frame.height(), frame.get_image().to_owned())
-										.expect("ImageBuffer couldn't be created");
-								image
+								match image::ImageBuffer::from_raw(frame.width(), frame.height(), frame.get_image().to_owned()){
+									Some(image)=>image,
+									None=>continue,
+								}
 							} else {
-								let image =
-									image::ImageBuffer::from_raw(frame.width(), frame.height(), frame.get_image().to_owned())
-										.expect("ImageBuffer couldn't be created");
-								DynamicImage::ImageRgb8(image).into_rgba8()
+								match image::ImageBuffer::from_raw(frame.width(), frame.height(), frame.get_image().to_owned()){
+									Some(image)=>DynamicImage::ImageRgb8(image).into_rgba8(),
+									None=>continue,
+								}
 							};
 							let delay=frame.get_time_ms()-offset;
 							offset=frame.get_time_ms();
@@ -201,7 +201,14 @@ impl RequestContext{
 		}
 	}
 	fn encode_anim(&self,frames:image::Frames,loop_count:u32)->axum::response::Response{
-		let conf=webp::WebPConfig::new().unwrap();
+		let conf=match webp::WebPConfig::new(){
+			Ok(c)=>c,
+			Err(_)=>{
+				let mut headers=self.headers.clone();
+				headers.append("X-Proxy-Error","WebPConfig init failed".parse().unwrap());
+				return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,headers).into_response();
+			}
+		};
 		let mut size:Option<(u32, u32)>=None;
 		let mut encoder=None;
 		let mut available_frames=0;
@@ -240,7 +247,10 @@ impl RequestContext{
 					}
 					let aframe=image_to_frame(&img,timestamp);
 					if let Ok(aframe)=aframe{
-						let res=encoder.as_mut().unwrap().add_frame(aframe);
+						let res=match encoder.as_mut(){
+							Some(enc)=>enc.add_frame(aframe),
+							None=>continue,
+						};
 						if let Err(e)=res{
 							err=Some(e);
 						}else{
@@ -320,7 +330,13 @@ impl RequestContext{
 				let height=img.height();
 				let rgba=img.into_rgba8();
 				let encoer=webp::Encoder::from_rgba(rgba.as_raw(),width,height);
-				let mut config=webp::WebPConfig::new().unwrap();
+				let mut config=match webp::WebPConfig::new(){
+					Ok(c)=>c,
+					Err(_)=>{
+						self.headers.append("X-Proxy-Error","WebPConfig init failed".parse().unwrap());
+						return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,self.headers.clone()).into_response();
+					}
+				};
 				config.quality=self.config.webp_quality;
 				return match encoer.encode_advanced(&config){
 					Ok(mem) => {
@@ -376,27 +392,34 @@ impl RequestContext{
 }
 
 fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:jpegxr::PixelFormat)->Option<DynamicImage>{
+	let buf_len = buffer.len();
+	// Validate minimum buffer size for stride-based formats
+	let required_size = if height > 0 { (height as usize - 1) * stride } else { 0 };
 	match info{
 		jpegxr::PixelFormat::PixelFormat8bppGray => {
 			image::ImageBuffer::from_raw(width,height,buffer).map(|i|DynamicImage::ImageLuma8(i))
 		},
 		jpegxr::PixelFormat::PixelFormat24bppBGR => {
-			let mut buffer=buffer;
+			let end = required_size + width as usize * 3;
+			if buf_len < end { return None; }
+			let mut rgb=Vec::with_capacity((width*height*3) as usize);
 			for y in 0..height{
 				for x in 0..width{
 					let offset=y as usize*stride+x as usize*3;
-					let r=buffer[offset];
-					buffer[y as usize*stride+x as usize*4]=buffer[offset+2];
-					buffer[offset+2]=r;
+					rgb.push(buffer[offset+2]); // R
+					rgb.push(buffer[offset+1]); // G
+					rgb.push(buffer[offset]);   // B
 				}
 			}
-			image::ImageBuffer::from_raw(width,height,buffer).map(|i|DynamicImage::ImageRgb8(i))
+			image::ImageBuffer::from_raw(width,height,rgb).map(|i|DynamicImage::ImageRgb8(i))
 		},
 		jpegxr::PixelFormat::PixelFormat24bppRGB => {
 			image::ImageBuffer::from_raw(width,height,buffer).map(|i|DynamicImage::ImageRgb8(i))
 		},
 		jpegxr::PixelFormat::PixelFormat32bppBGR => {
-			let mut raw_img=Vec::with_capacity(height as usize*3);
+			let end = required_size + width as usize * 4 + 2;
+			if buf_len < end { return None; }
+			let mut raw_img=Vec::with_capacity((width as usize)*(height as usize)*3);
 			for y in 0..height{
 				for x in 0..width{
 					raw_img.push(buffer[y as usize*stride+x as usize*4+2]);
@@ -407,6 +430,8 @@ fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:jpegxr::Pixe
 			image::ImageBuffer::from_raw(width,height,raw_img).map(|i|DynamicImage::ImageRgb8(i))
 		},
 		jpegxr::PixelFormat::PixelFormat32bppBGRA => {
+			let end = required_size + width as usize * 4 + 2;
+			if buf_len < end { return None; }
 			let mut buffer=buffer;
 			for y in 0..height{
 				for x in 0..width{
@@ -419,7 +444,9 @@ fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:jpegxr::Pixe
 			image::ImageBuffer::from_raw(width,height,buffer).map(|i|DynamicImage::ImageRgba8(i))
 		},
 		jpegxr::PixelFormat::PixelFormat32bppRGB => {
-			let mut raw_img=Vec::with_capacity(height as usize*3);
+			let end = required_size + width as usize * 4 + 2;
+			if buf_len < end { return None; }
+			let mut raw_img=Vec::with_capacity((width as usize)*(height as usize)*3);
 			for y in 0..height{
 				for x in 0..width{
 					raw_img.push(buffer[y as usize*stride+x as usize*4+0]);
@@ -436,7 +463,7 @@ fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:jpegxr::Pixe
 	}
 }
 
-pub fn image_to_frame(image: &DynamicImage, timestamp: i32) -> Result<webp::AnimFrame, &'static str> {
+pub fn image_to_frame(image: &DynamicImage, timestamp: i32) -> Result<webp::AnimFrame<'_>, &'static str> {
 	match image {
 		DynamicImage::ImageLuma8(_) => Err("Unimplemented"),
 		DynamicImage::ImageLumaA8(_) => Err("Unimplemented"),
@@ -467,7 +494,7 @@ fn resize(img:DynamicImage,max_width:u32,max_height:u32,filter:fast_image_resize
 		algorithm:fast_image_resize::ResizeAlg::Convolution(filter),
 		..Default::default()
 	};
-	resizer.resize(&src_image, &mut dst_image, &options).unwrap();
+	resizer.resize(&src_image, &mut dst_image, &options).ok()?;
 	let rgba=image::RgbaImage::from_raw(dst_image.width(),dst_image.height(),dst_image.into_vec());
 	Some(DynamicImage::ImageRgba8(rgba?))
 }

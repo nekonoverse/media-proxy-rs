@@ -34,9 +34,22 @@ impl RequestContext{
 		}else{
 			(size.width() as u32,size.height() as u32,1f32)
 		};
+		// Cap SVG rasterization dimensions to prevent decompression bomb
+		const MAX_SVG_DIM: u32 = 4096;
+		if width > MAX_SVG_DIM || height > MAX_SVG_DIM {
+			return Err(());
+		}
 		let tf=usvg::Transform::from_scale(scale,scale);
-		let mut rgba=vec![0;(width*height*4) as usize];
-		let mut pxmap=resvg::tiny_skia::PixmapMut::from_bytes(&mut rgba,width,height).unwrap();
+		// Use u64 arithmetic to prevent overflow on width*height*4
+		let buf_size = width as u64 * height as u64 * 4;
+		if buf_size > 64 * 1024 * 1024 { // 64 MB max pixel buffer
+			return Err(());
+		}
+		let mut rgba=vec![0;buf_size as usize];
+		let mut pxmap=match resvg::tiny_skia::PixmapMut::from_bytes(&mut rgba,width,height){
+			Some(p) => p,
+			None => return Err(()),
+		};
 		resvg::render(&tree,tf,&mut pxmap);
 		match ImageBuffer::from_vec(width,height,rgba){
 			Some(img)=>{
