@@ -83,7 +83,10 @@ pub struct ConfigFile{
 	allowed_networks:Option<Vec<String>>,
 	blocked_networks:Option<Vec<String>>,
 	blocked_hosts:Option<Vec<String>>,
+	#[serde(default="default_max_concurrent")]
+	max_concurrent:u32,
 }
+fn default_max_concurrent()->u32{ 64 }
 
 /// Pre-parsed runtime config (parsed once at startup, shared via Arc)
 pub struct RuntimeConfig{
@@ -239,6 +242,7 @@ fn main() {
 			allowed_networks:None,
 			blocked_networks:None,
 			blocked_hosts:None,
+			max_concurrent:64,
 		};
 		let default_config=serde_json::to_string_pretty(&default_config).expect("serialize default config");
 		std::fs::File::create(&config_path).expect("create default config.json").write_all(default_config.as_bytes()).expect("write default config");
@@ -289,7 +293,8 @@ fn main() {
 	fontdb.load_font_source(resvg::usvg::fontdb::Source::Binary(Arc::new(include_bytes!("../asset/font/Aileron-Light.otf"))));
 	let fontdb=Arc::new(fontdb);
 	let bind_addr=runtime_config.config.bind_addr.clone();
-	let arg_tup=(client,runtime_config,dummy_png,fontdb);
+	let semaphore=Arc::new(tokio::sync::Semaphore::new(runtime_config.config.max_concurrent as usize));
+	let arg_tup=(client,runtime_config,dummy_png,fontdb,semaphore);
 	rt.block_on(async{
 		let app = Router::new();
 		let arg_tup0=arg_tup.clone();
@@ -394,9 +399,12 @@ const MAX_REDIRECTS: usize = 5;
 async fn get_file(
 	_path:Option<axum::extract::Path<String>>,
 	client_headers:axum::http::HeaderMap,
-	(client,rtc,dummy_img,fontdb):(reqwest::Client,Arc<RuntimeConfig>,Arc<Vec<u8>>,Arc<resvg::usvg::fontdb::Database>),
+	(client,rtc,dummy_img,fontdb,semaphore):(reqwest::Client,Arc<RuntimeConfig>,Arc<Vec<u8>>,Arc<resvg::usvg::fontdb::Database>,Arc<tokio::sync::Semaphore>),
 	axum::extract::Query(q):axum::extract::Query<RequestParams>,
 )->Result<(axum::http::StatusCode,HeaderMap,axum::body::Body),axum::response::Response>{
+	let _permit = semaphore.try_acquire().map_err(|_| {
+		(axum::http::StatusCode::SERVICE_UNAVAILABLE, HeaderMap::new()).into_response()
+	})?;
 	println!("{}\t{}\tavatar:{:?}\tpreview:{:?}\tbadge:{:?}\temoji:{:?}\tstatic:{:?}\tfallback:{:?}",
 		chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
 		truncate_url(&q.url, 200),
@@ -807,6 +815,7 @@ mod tests {
 			allowed_networks: None,
 			blocked_networks: None,
 			blocked_hosts: Some(vec!["evil.com".to_owned(), "Evil.Net".to_owned()]),
+			max_concurrent: 64,
 		};
 		build_runtime_config(config)
 	}
