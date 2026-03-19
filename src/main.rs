@@ -7,6 +7,61 @@ use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 
+/// Custom DNS resolver that validates resolved IPs against SSRF rules at connect time.
+/// This eliminates the TOCTOU gap between check_url() and reqwest's actual connection.
+struct SafeResolver {
+	rtc: Arc<RuntimeConfig>,
+}
+impl reqwest::dns::Resolve for SafeResolver {
+	fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+		let rtc = self.rtc.clone();
+		let host = name.as_str().to_owned();
+		Box::pin(async move {
+			use std::net::ToSocketAddrs;
+			let addrs: Vec<SocketAddr> = format!("{}:0", host)
+				.to_socket_addrs()
+				.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+				.collect();
+			if addrs.is_empty() {
+				return Err(Box::new(std::io::Error::new(
+					std::io::ErrorKind::Other, "no addresses resolved",
+				)) as Box<dyn std::error::Error + Send + Sync>);
+			}
+			for addr in &addrs {
+				match addr {
+					SocketAddr::V4(v4) => {
+						if let Some(ref custom_blocked) = rtc.ipv4_custom_blocked {
+							if custom_blocked.contains(v4.ip()) {
+								return Err(Box::new(std::io::Error::new(
+									std::io::ErrorKind::PermissionDenied, "Blocked address",
+								)) as Box<dyn std::error::Error + Send + Sync>);
+							}
+						}
+						if rtc.ipv4_blocked.contains(v4.ip()) {
+							let allow = rtc.ipv4_allowed.as_ref()
+								.map(|a| a.contains(v4.ip()))
+								.unwrap_or(false);
+							if !allow {
+								return Err(Box::new(std::io::Error::new(
+									std::io::ErrorKind::PermissionDenied, "Blocked address",
+								)) as Box<dyn std::error::Error + Send + Sync>);
+							}
+						}
+					},
+					SocketAddr::V6(v6) => {
+						if is_ipv6_blocked(v6.ip()) {
+							return Err(Box::new(std::io::Error::new(
+								std::io::ErrorKind::PermissionDenied, "Blocked address",
+							)) as Box<dyn std::error::Error + Send + Sync>);
+						}
+					},
+				}
+			}
+			Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+		})
+	}
+}
+
 mod img;
 mod svg;
 mod browsersafe;
@@ -217,7 +272,8 @@ fn main() {
 	let runtime_config=Arc::new(runtime_config);
 	let rt=tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("build tokio runtime");
 	let client=reqwest::ClientBuilder::new()
-		.redirect(reqwest::redirect::Policy::none()); // Disable auto-redirect for SSRF protection
+		.redirect(reqwest::redirect::Policy::none()) // Disable auto-redirect for SSRF protection
+		.dns_resolver(Arc::new(SafeResolver{ rtc: runtime_config.clone() }));
 	let client=match &runtime_config.config.proxy{
 		Some(url)=>client.proxy(reqwest::Proxy::http(url).expect("invalid proxy URL")),
 		None=>client,
