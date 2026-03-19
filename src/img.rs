@@ -166,15 +166,15 @@ impl RequestContext{
 						dec.sort_by_time_stamp();
 						for frame in dec.into_iter(){
 							let img=if frame.get_layout().is_alpha() {
-								let image =
-									image::ImageBuffer::from_raw(frame.width(), frame.height(), frame.get_image().to_owned())
-										.expect("ImageBuffer couldn't be created");
-								image
+								match image::ImageBuffer::from_raw(frame.width(), frame.height(), frame.get_image().to_owned()){
+									Some(image)=>image,
+									None=>continue,
+								}
 							} else {
-								let image =
-									image::ImageBuffer::from_raw(frame.width(), frame.height(), frame.get_image().to_owned())
-										.expect("ImageBuffer couldn't be created");
-								DynamicImage::ImageRgb8(image).into_rgba8()
+								match image::ImageBuffer::from_raw(frame.width(), frame.height(), frame.get_image().to_owned()){
+									Some(image)=>DynamicImage::ImageRgb8(image).into_rgba8(),
+									None=>continue,
+								}
 							};
 							let delay=frame.get_time_ms()-offset;
 							offset=frame.get_time_ms();
@@ -201,7 +201,14 @@ impl RequestContext{
 		}
 	}
 	fn encode_anim(&self,frames:image::Frames,loop_count:u32)->axum::response::Response{
-		let conf=webp::WebPConfig::new().unwrap();
+		let conf=match webp::WebPConfig::new(){
+			Some(c)=>c,
+			None=>{
+				let mut headers=self.headers.clone();
+				headers.append("X-Proxy-Error","WebPConfig init failed".parse().unwrap());
+				return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,headers).into_response();
+			}
+		};
 		let mut size:Option<(u32, u32)>=None;
 		let mut encoder=None;
 		let mut available_frames=0;
@@ -240,7 +247,10 @@ impl RequestContext{
 					}
 					let aframe=image_to_frame(&img,timestamp);
 					if let Ok(aframe)=aframe{
-						let res=encoder.as_mut().unwrap().add_frame(aframe);
+						let res=match encoder.as_mut(){
+							Some(enc)=>enc.add_frame(aframe),
+							None=>continue,
+						};
 						if let Err(e)=res{
 							err=Some(e);
 						}else{
@@ -320,7 +330,13 @@ impl RequestContext{
 				let height=img.height();
 				let rgba=img.into_rgba8();
 				let encoer=webp::Encoder::from_rgba(rgba.as_raw(),width,height);
-				let mut config=webp::WebPConfig::new().unwrap();
+				let mut config=match webp::WebPConfig::new(){
+					Some(c)=>c,
+					None=>{
+						self.headers.append("X-Proxy-Error","WebPConfig init failed".parse().unwrap());
+						return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,self.headers.clone()).into_response();
+					}
+				};
 				config.quality=self.config.webp_quality;
 				return match encoer.encode_advanced(&config){
 					Ok(mem) => {
