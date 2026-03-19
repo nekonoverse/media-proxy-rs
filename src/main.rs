@@ -738,7 +738,7 @@ impl RequestContext{
 			})
 		}
 	}
-	async fn load_all(&mut self,mut resp: PreDataStream)->Result<(),axum::response::Response>{
+	async fn load_all(&mut self,resp: PreDataStream)->Result<(),axum::response::Response>{
 		let len_hint=resp.content_length.unwrap_or(2048.min(self.config.max_size));
 		if len_hint>self.config.max_size{
 			self.headers.append("X-Proxy-Error","content-too-large".parse().unwrap());
@@ -746,24 +746,41 @@ impl RequestContext{
 		}
 		// Cap initial allocation to 4 MB to prevent malicious Content-Length from causing huge alloc
 		let initial_cap = std::cmp::min(len_hint as usize, 4 * 1024 * 1024);
-		let mut response_bytes=Vec::with_capacity(initial_cap);
-		while let Some(x) = resp.next().await{
-			match x{
-				Ok(b)=>{
-					if response_bytes.len()+b.len()>self.config.max_size as usize{
-						self.headers.append("X-Proxy-Error","content-too-large".parse().unwrap());
-						return Err((axum::http::StatusCode::BAD_GATEWAY,self.headers.clone()).into_response())
+		let max_size = self.config.max_size;
+		// Aggregate timeout: 3x the per-request timeout to prevent slow-drip attacks
+		let download_timeout = std::time::Duration::from_millis(self.config.timeout * 3);
+		let download_result = tokio::time::timeout(download_timeout, async move {
+			let mut response_bytes=Vec::with_capacity(initial_cap);
+			let mut resp = resp;
+			while let Some(x) = resp.next().await{
+				match x{
+					Ok(b)=>{
+						if response_bytes.len()+b.len()>max_size as usize{
+							return Err("content-too-large");
+						}
+						response_bytes.extend_from_slice(&b);
+					},
+					Err(_)=>{
+						return Err("upstream-read-error");
 					}
-					response_bytes.extend_from_slice(&b);
-				},
-				Err(_)=>{
-					self.headers.append("X-Proxy-Error","upstream-read-error".parse().unwrap());
-					return Err((axum::http::StatusCode::BAD_GATEWAY,self.headers.clone()).into_response())
 				}
 			}
+			Ok(response_bytes)
+		}).await;
+		match download_result {
+			Ok(Ok(bytes)) => {
+				self.src_bytes = bytes;
+				Ok(())
+			},
+			Ok(Err(e)) => {
+				self.headers.append("X-Proxy-Error", e.parse().unwrap());
+				Err((axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response())
+			},
+			Err(_) => {
+				self.headers.append("X-Proxy-Error", "download-timeout".parse().unwrap());
+				Err((axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response())
+			}
 		}
-		self.src_bytes=response_bytes;
-		Ok(())
 	}
 }
 struct PreDataStream{
