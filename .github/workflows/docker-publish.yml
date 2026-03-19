@@ -200,6 +200,8 @@ jobs:
 
   e2e-test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     needs:
       - build
     strategy:
