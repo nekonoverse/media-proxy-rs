@@ -381,16 +381,16 @@ fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:jpegxr::Pixe
 			image::ImageBuffer::from_raw(width,height,buffer).map(|i|DynamicImage::ImageLuma8(i))
 		},
 		jpegxr::PixelFormat::PixelFormat24bppBGR => {
-			let mut buffer=buffer;
+			let mut rgb=Vec::with_capacity((width*height*3) as usize);
 			for y in 0..height{
 				for x in 0..width{
 					let offset=y as usize*stride+x as usize*3;
-					let r=buffer[offset];
-					buffer[y as usize*stride+x as usize*4]=buffer[offset+2];
-					buffer[offset+2]=r;
+					rgb.push(buffer[offset+2]); // R
+					rgb.push(buffer[offset+1]); // G
+					rgb.push(buffer[offset]);   // B
 				}
 			}
-			image::ImageBuffer::from_raw(width,height,buffer).map(|i|DynamicImage::ImageRgb8(i))
+			image::ImageBuffer::from_raw(width,height,rgb).map(|i|DynamicImage::ImageRgb8(i))
 		},
 		jpegxr::PixelFormat::PixelFormat24bppRGB => {
 			image::ImageBuffer::from_raw(width,height,buffer).map(|i|DynamicImage::ImageRgb8(i))
@@ -467,7 +467,7 @@ fn resize(img:DynamicImage,max_width:u32,max_height:u32,filter:fast_image_resize
 		algorithm:fast_image_resize::ResizeAlg::Convolution(filter),
 		..Default::default()
 	};
-	resizer.resize(&src_image, &mut dst_image, &options).unwrap();
+	resizer.resize(&src_image, &mut dst_image, &options).ok()?;
 	let rgba=image::RgbaImage::from_raw(dst_image.width(),dst_image.height(),dst_image.into_vec());
 	Some(DynamicImage::ImageRgba8(rgba?))
 }
