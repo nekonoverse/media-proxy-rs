@@ -166,15 +166,32 @@ fn main() {
 	}
 	fontdb.load_font_source(resvg::usvg::fontdb::Source::Binary(Arc::new(include_bytes!("../asset/font/Aileron-Light.otf"))));
 	let fontdb=Arc::new(fontdb);
+	let bind_addr=config.bind_addr.clone();
 	let arg_tup=(client,config,dummy_png,fontdb);
 	rt.block_on(async{
-		let http_addr:SocketAddr = arg_tup.1.bind_addr.parse().unwrap();
-		let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
 		let app = Router::new();
 		let arg_tup0=arg_tup.clone();
 		let app=app.route("/",axum::routing::get(move|headers,parms|get_file(None,headers,arg_tup0.clone(),parms)));
 		let app=app.route("/{*path}",axum::routing::get(move|path,headers,parms|get_file(Some(path),headers,arg_tup.clone(),parms)));
-		axum::serve(listener,app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown_signal()).await.unwrap();
+		let bind_addr=&bind_addr;
+		if bind_addr.starts_with("/") || bind_addr.ends_with(".sock") {
+			// Unix domain socket mode
+			let path=std::path::Path::new(bind_addr);
+			if path.exists() {
+				std::fs::remove_file(path).expect("failed to remove existing socket file");
+			}
+			let listener=tokio::net::UnixListener::bind(path).expect("failed to bind unix socket");
+			println!("Listening on unix:{}",bind_addr);
+			axum::serve(listener,app.into_make_service()).with_graceful_shutdown(shutdown_signal()).await.unwrap();
+			// Clean up socket on shutdown
+			let _=std::fs::remove_file(path);
+		} else {
+			// TCP mode
+			let http_addr:SocketAddr=bind_addr.parse().unwrap();
+			let listener=tokio::net::TcpListener::bind(http_addr).await.unwrap();
+			println!("Listening on tcp://{}",http_addr);
+			axum::serve(listener,app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown_signal()).await.unwrap();
+		}
 	});
 }
 async fn check_url(config:&Arc<ConfigFile>,url:impl AsRef<str>)->Result<(),String>{
