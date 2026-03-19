@@ -202,8 +202,8 @@ impl RequestContext{
 	}
 	fn encode_anim(&self,frames:image::Frames,loop_count:u32)->axum::response::Response{
 		let conf=match webp::WebPConfig::new(){
-			Some(c)=>c,
-			None=>{
+			Ok(c)=>c,
+			Err(_)=>{
 				let mut headers=self.headers.clone();
 				headers.append("X-Proxy-Error","WebPConfig init failed".parse().unwrap());
 				return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,headers).into_response();
@@ -331,8 +331,8 @@ impl RequestContext{
 				let rgba=img.into_rgba8();
 				let encoer=webp::Encoder::from_rgba(rgba.as_raw(),width,height);
 				let mut config=match webp::WebPConfig::new(){
-					Some(c)=>c,
-					None=>{
+					Ok(c)=>c,
+					Err(_)=>{
 						self.headers.append("X-Proxy-Error","WebPConfig init failed".parse().unwrap());
 						return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,self.headers.clone()).into_response();
 					}
