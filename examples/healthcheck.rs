@@ -104,10 +104,7 @@ async fn uds_request(sock_path: &str, path: &str) -> u16 {
 		Err(_) => return 504,
 	};
 	let (mut reader, mut writer) = tokio::io::split(stream);
-	let request = format!(
-		"GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-		path
-	);
+	let request = format!("GET {} HTTP/1.0\r\n\r\n", path);
 	if writer.write_all(request.as_bytes()).await.is_err() {
 		return 504;
 	}
