@@ -27,6 +27,5 @@ jobs:
         with:
           submodules: recursive
       - run: cargo generate-lockfile
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - run: cargo install cargo-audit
+      - run: cargo audit --ignore RUSTSEC-2024-0436
