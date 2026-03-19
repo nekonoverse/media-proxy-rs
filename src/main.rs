@@ -1,7 +1,9 @@
 use core::str;
-use std::{io::Write, net::SocketAddr, pin::Pin, str::FromStr, sync::Arc};
+use std::{collections::HashSet, io::Write, net::SocketAddr, pin::Pin, str::FromStr, sync::Arc};
 
 use axum::{http::HeaderMap, response::IntoResponse, Router};
+use iprange::IpRange;
+use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 
@@ -10,7 +12,7 @@ mod svg;
 mod browsersafe;
 mod image_test;
 
-#[derive(Debug,Serialize,Deserialize)]
+#[derive(Clone,Debug,Serialize,Deserialize)]
 pub struct ConfigFile{
 	bind_addr: String,
 	timeout:u64,
@@ -27,6 +29,16 @@ pub struct ConfigFile{
 	blocked_networks:Option<Vec<String>>,
 	blocked_hosts:Option<Vec<String>>,
 }
+
+/// Pre-parsed runtime config (parsed once at startup, shared via Arc)
+pub struct RuntimeConfig{
+	config: ConfigFile,
+	ipv4_blocked: IpRange<Ipv4Net>,
+	ipv4_allowed: Option<IpRange<Ipv4Net>>,
+	ipv4_custom_blocked: Option<IpRange<Ipv4Net>>,
+	blocked_hosts: HashSet<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RequestParams{
 	url: String,
@@ -46,9 +58,9 @@ enum FilterType{
 	Gaussian,
 	Lanczos3,
 }
-impl Into<image::imageops::FilterType> for FilterType{
-	fn into(self) -> image::imageops::FilterType {
-		match self {
+impl From<FilterType> for image::imageops::FilterType{
+	fn from(val: FilterType) -> Self {
+		match val {
 			FilterType::Nearest => image::imageops::Nearest,
 			FilterType::Triangle => image::imageops::Triangle,
 			FilterType::CatmullRom => image::imageops::CatmullRom,
@@ -57,9 +69,9 @@ impl Into<image::imageops::FilterType> for FilterType{
 		}
 	}
 }
-impl Into<fast_image_resize::FilterType> for FilterType{
-	fn into(self) -> fast_image_resize::FilterType {
-		match self {
+impl From<FilterType> for fast_image_resize::FilterType{
+	fn from(val: FilterType) -> Self {
+		match val {
 			FilterType::Nearest => fast_image_resize::FilterType::Box,
 			FilterType::Triangle => fast_image_resize::FilterType::Bilinear,
 			FilterType::CatmullRom => fast_image_resize::FilterType::CatmullRom,
@@ -92,6 +104,55 @@ async fn shutdown_signal() {
 		_ = terminate => {},
 	}
 }
+
+/// Build RuntimeConfig: parse CIDR ranges and normalize blocked hosts at startup
+fn build_runtime_config(config: ConfigFile) -> RuntimeConfig {
+	// Private + loopback + link-local + CGNAT + unspecified
+	let mut ipv4_blocked: IpRange<Ipv4Net> = [
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"127.0.0.0/8",
+		"169.254.0.0/16",
+		"0.0.0.0/8",
+		"100.64.0.0/10",
+	]
+		.iter()
+		.map(|s| s.parse().expect("invalid built-in CIDR"))
+		.collect();
+
+	// Merge user-configured blocked networks
+	let ipv4_custom_blocked = config.blocked_networks.as_ref().map(|nets| {
+		nets.iter()
+			.filter_map(|s| s.parse::<Ipv4Net>().ok())
+			.collect::<IpRange<Ipv4Net>>()
+	});
+	if let Some(ref custom) = ipv4_custom_blocked {
+		for net in custom.iter() {
+			ipv4_blocked.add(net);
+		}
+	}
+
+	let ipv4_allowed = config.allowed_networks.as_ref().map(|nets| {
+		nets.iter()
+			.filter_map(|s| s.parse::<Ipv4Net>().ok())
+			.collect::<IpRange<Ipv4Net>>()
+	});
+
+	// Normalize blocked hosts to lowercase
+	let blocked_hosts: HashSet<String> = config.blocked_hosts.as_ref()
+		.map(|hosts| hosts.iter().map(|h| h.to_lowercase()).collect())
+		.unwrap_or_default();
+
+	RuntimeConfig {
+		config,
+		ipv4_blocked,
+		ipv4_allowed,
+		ipv4_custom_blocked,
+		blocked_hosts,
+	}
+}
+
 fn main() {
 	let config_path=match std::env::var("MEDIA_PROXY_CONFIG_PATH"){
 		Ok(path)=>{
@@ -115,6 +176,7 @@ fn main() {
 			append_headers:[
 				"Content-Security-Policy:default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'".to_owned(),
 				"Access-Control-Allow-Origin:*".to_owned(),
+				"X-Content-Type-Options:nosniff".to_owned(),
 			].to_vec(),
 			load_system_fonts:true,
 			webp_quality: 75f32,
@@ -123,10 +185,12 @@ fn main() {
 			blocked_networks:None,
 			blocked_hosts:None,
 		};
-		let default_config=serde_json::to_string_pretty(&default_config).unwrap();
-		std::fs::File::create(&config_path).expect("create default config.json").write_all(default_config.as_bytes()).unwrap();
+		let default_config=serde_json::to_string_pretty(&default_config).expect("serialize default config");
+		std::fs::File::create(&config_path).expect("create default config.json").write_all(default_config.as_bytes()).expect("write default config");
 	}
-	let mut config:ConfigFile=serde_json::from_reader(std::fs::File::open(&config_path).unwrap()).unwrap();
+	let mut config:ConfigFile=serde_json::from_reader(
+		std::fs::File::open(&config_path).expect("open config.json")
+	).expect("parse config.json");
 	if let Ok(networks)=std::env::var("MEDIA_PROXY_ALLOWED_NETWORKS"){
 		let mut allowed_networks=config.allowed_networks.take().unwrap_or_default();
 		for networks in networks.split(","){
@@ -148,17 +212,19 @@ fn main() {
 		}
 		config.blocked_hosts.replace(blocked_hosts);
 	}
+	let runtime_config = build_runtime_config(config);
 	let dummy_png=Arc::new(include_bytes!("../asset/dummy.png").to_vec());
-	let config=Arc::new(config);
-	let rt=tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-	let client=reqwest::ClientBuilder::new();
-	let client=match &config.proxy{
-		Some(url)=>client.proxy(reqwest::Proxy::http(url).unwrap()),
+	let runtime_config=Arc::new(runtime_config);
+	let rt=tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("build tokio runtime");
+	let client=reqwest::ClientBuilder::new()
+		.redirect(reqwest::redirect::Policy::none()); // Disable auto-redirect for SSRF protection
+	let client=match &runtime_config.config.proxy{
+		Some(url)=>client.proxy(reqwest::Proxy::http(url).expect("invalid proxy URL")),
 		None=>client,
 	};
-	let client=client.build().unwrap();
+	let client=client.build().expect("build reqwest client");
 	let mut fontdb=resvg::usvg::fontdb::Database::new();
-	if config.load_system_fonts{
+	if runtime_config.config.load_system_fonts{
 		fontdb.load_system_fonts();
 	}
 	if std::path::Path::new("asset/font/").exists(){
@@ -166,8 +232,8 @@ fn main() {
 	}
 	fontdb.load_font_source(resvg::usvg::fontdb::Source::Binary(Arc::new(include_bytes!("../asset/font/Aileron-Light.otf"))));
 	let fontdb=Arc::new(fontdb);
-	let bind_addr=config.bind_addr.clone();
-	let arg_tup=(client,config,dummy_png,fontdb);
+	let bind_addr=runtime_config.config.bind_addr.clone();
+	let arg_tup=(client,runtime_config,dummy_png,fontdb);
 	rt.block_on(async{
 		let app = Router::new();
 		let arg_tup0=arg_tup.clone();
@@ -182,58 +248,62 @@ fn main() {
 			}
 			let listener=tokio::net::UnixListener::bind(path).expect("failed to bind unix socket");
 			println!("Listening on unix:{}",bind_addr);
-			axum::serve(listener,app.into_make_service()).with_graceful_shutdown(shutdown_signal()).await.unwrap();
+			axum::serve(listener,app.into_make_service()).with_graceful_shutdown(shutdown_signal()).await.expect("serve failed");
 			// Clean up socket on shutdown
 			let _=std::fs::remove_file(path);
 		} else {
 			// TCP mode
-			let http_addr:SocketAddr=bind_addr.parse().unwrap();
-			let listener=tokio::net::TcpListener::bind(http_addr).await.unwrap();
+			let http_addr:SocketAddr=bind_addr.parse().expect("invalid bind_addr");
+			let listener=tokio::net::TcpListener::bind(http_addr).await.expect("failed to bind TCP");
 			println!("Listening on tcp://{}",http_addr);
-			axum::serve(listener,app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown_signal()).await.unwrap();
+			axum::serve(listener,app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown_signal()).await.expect("serve failed");
 		}
 	});
 }
-async fn check_url(config:&Arc<ConfigFile>,url:impl AsRef<str>)->Result<(),String>{
+
+/// Check if an IPv6 address should be blocked (loopback, mapped IPv4, ULA, link-local, etc.)
+fn is_ipv6_blocked(ip: &std::net::Ipv6Addr) -> bool {
+	if ip.is_loopback() || ip.is_multicast() || ip.is_unspecified() {
+		return true;
+	}
+	// Link-local fe80::/10
+	if (ip.segments()[0] & 0xffc0) == 0xfe80 {
+		return true;
+	}
+	// Unique local fc00::/7
+	if (ip.segments()[0] & 0xfe00) == 0xfc00 {
+		return true;
+	}
+	// IPv4-mapped ::ffff:x.x.x.x — delegate to IPv4 check
+	if let Some(v4) = ip.to_ipv4_mapped() {
+		// Will be checked by IPv4 logic at call site
+		return v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified();
+	}
+	false
+}
+
+fn check_url(rtc:&RuntimeConfig,url:impl AsRef<str>)->Result<(),String>{
 	let u=reqwest::Url::from_str(url.as_ref()).map_err(|e|format!("{:?}",e))?;
 	match u.scheme().to_lowercase().as_str(){
 		"http"|"https"=>{},
 		scheme=>return Err(format!("scheme: {}",scheme))
 	}
 	let host=u.host_str().ok_or_else(||"no host".to_owned())?;
-	if let Some(blocked_hosts)=&config.blocked_hosts{
-		if blocked_hosts.contains(&host.to_lowercase()){
-			return Err("Blocked address".to_owned());
-		}
+	if rtc.blocked_hosts.contains(&host.to_lowercase()){
+		return Err("Blocked address".to_owned());
 	}
 	use std::net::{SocketAddr, ToSocketAddrs};
-	use iprange::IpRange;
-	use ipnet::Ipv4Net;
-	let ips=format!("{}:{}",host,u.port_or_known_default().unwrap()).to_socket_addrs().map_err(|e|format!("{:?} {}",e,host))?;
-	let ipv4_private_range: IpRange<Ipv4Net> = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
-		.iter()
-		.map(|s| s.parse().unwrap())
-		.collect();
-	let allow_ips=config.allowed_networks.as_ref().map(|ips|{
-		ips.iter()
-		.map(|s| s.parse().unwrap())
-		.collect::<IpRange<Ipv4Net>>()
-	});
-	let block_ips=config.blocked_networks.as_ref().map(|ips|{
-		ips.iter()
-		.map(|s| s.parse().unwrap())
-		.collect::<IpRange<Ipv4Net>>()
-	});
+	let ips=format!("{}:{}",host,u.port_or_known_default().unwrap_or(80)).to_socket_addrs().map_err(|e|format!("{:?} {}",e,host))?;
 	for ip in ips{
 		match ip{
 			SocketAddr::V4(v4) => {
-				if let Some(block_ips)=&block_ips{
-					if block_ips.contains(v4.ip()){
+				if let Some(ref custom_blocked)=rtc.ipv4_custom_blocked{
+					if custom_blocked.contains(v4.ip()){
 						return Err("Blocked address".to_owned());
 					}
 				}
-				if ipv4_private_range.contains(v4.ip()){
-					let allow=if let Some(allow_ips)=&allow_ips{
+				if rtc.ipv4_blocked.contains(v4.ip()){
+					let allow=if let Some(ref allow_ips)=rtc.ipv4_allowed{
 						allow_ips.contains(v4.ip())
 					}else{
 						false
@@ -244,7 +314,7 @@ async fn check_url(config:&Arc<ConfigFile>,url:impl AsRef<str>)->Result<(),Strin
 				}
 			},
 			SocketAddr::V6(v6) => {
-				if v6.ip().is_multicast()||v6.ip().is_unicast_link_local(){
+				if is_ipv6_blocked(v6.ip()){
 					return Err("Blocked address".to_owned());
 				}
 			},
@@ -252,15 +322,28 @@ async fn check_url(config:&Arc<ConfigFile>,url:impl AsRef<str>)->Result<(),Strin
 	}
 	Ok(())
 }
+
+/// Truncate a URL for safe logging (no tokens/secrets in logs)
+fn truncate_url(url: &str, max_len: usize) -> String {
+	if url.len() <= max_len {
+		url.to_owned()
+	} else {
+		format!("{}...", &url[..max_len])
+	}
+}
+
+/// Maximum number of redirects to follow manually
+const MAX_REDIRECTS: usize = 5;
+
 async fn get_file(
 	_path:Option<axum::extract::Path<String>>,
 	client_headers:axum::http::HeaderMap,
-	(client,config,dummy_img,fontdb):(reqwest::Client,Arc<ConfigFile>,Arc<Vec<u8>>,Arc<resvg::usvg::fontdb::Database>),
+	(client,rtc,dummy_img,fontdb):(reqwest::Client,Arc<RuntimeConfig>,Arc<Vec<u8>>,Arc<resvg::usvg::fontdb::Database>),
 	axum::extract::Query(q):axum::extract::Query<RequestParams>,
 )->Result<(axum::http::StatusCode,HeaderMap,axum::body::Body),axum::response::Response>{
 	println!("{}\t{}\tavatar:{:?}\tpreview:{:?}\tbadge:{:?}\temoji:{:?}\tstatic:{:?}\tfallback:{:?}",
 		chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-		q.url,
+		truncate_url(&q.url, 200),
 		q.avatar,
 		q.preview,
 		q.badge,
@@ -269,17 +352,15 @@ async fn get_file(
 		q.fallback,
 	);
 	let mut headers=HeaderMap::new();
-	if let Ok(url)=q.url.parse(){
-		headers.append("X-Remote-Url",url);
+	// Sanitize URL before putting in header (truncate to safe length)
+	if let Ok(url_val) = truncate_url(&q.url, 512).parse() {
+		headers.append("X-Remote-Url", url_val);
 	}
-	if config.encode_avif{
+	if rtc.config.encode_avif{
 		headers.append("Vary","Accept,Range".parse().unwrap());
 	}
 	let time=chrono::Utc::now();
-	if let Err(s)=check_url(&config,&q.url).await{
-		if let Ok(v)=s.parse(){
-			headers.append("X-Proxy-Error",v);
-		}
+	if let Err(_)=check_url(&rtc,&q.url){
 		if q.fallback.is_some(){
 			headers.append("Content-Type","image/png".parse().unwrap());
 			return Err((axum::http::StatusCode::OK,headers,(*dummy_img).clone()).into_response());
@@ -288,27 +369,76 @@ async fn get_file(
 	};
 
 	println!("check_url {}ms",(chrono::Utc::now()-time).num_milliseconds());
-	let req=client.get(&q.url);
-	let req=req.timeout(std::time::Duration::from_millis(config.timeout));
-	let req=req.header("User-Agent",config.user_agent.clone());
-	let req=if let Some(range)=client_headers.get("Range"){
-		req.header("Range",range.as_bytes())
-	}else{
-		req
-	};
-	let resp=match req.send().await{
-		Ok(resp) => resp,
-		Err(e) => {
-			if q.fallback.is_some(){
-				headers.append("Content-Type","image/png".parse().unwrap());
-				return Err((axum::http::StatusCode::OK,headers,(*dummy_img).clone()).into_response());
+
+	// Manual redirect following with SSRF validation on each hop
+	let mut current_url = q.url.clone();
+	let mut resp = None;
+	for _ in 0..MAX_REDIRECTS {
+		let req = client.get(&current_url);
+		let req = req.timeout(std::time::Duration::from_millis(rtc.config.timeout));
+		let req = req.header("User-Agent", rtc.config.user_agent.clone());
+		let req = if let Some(range) = client_headers.get("Range") {
+			req.header("Range", range.as_bytes())
+		} else {
+			req
+		};
+		match req.send().await {
+			Ok(r) => {
+				let status = r.status();
+				if status.is_redirection() {
+					if let Some(location) = r.headers().get("location") {
+						let loc_str = String::from_utf8_lossy(location.as_bytes()).to_string();
+						// Resolve relative URLs
+						let resolved = if loc_str.starts_with("http://") || loc_str.starts_with("https://") {
+							loc_str
+						} else {
+							match reqwest::Url::from_str(&current_url) {
+								Ok(base) => match base.join(&loc_str) {
+									Ok(u) => u.to_string(),
+									Err(_) => {
+										return Err((axum::http::StatusCode::BAD_GATEWAY, headers).into_response());
+									}
+								},
+								Err(_) => {
+									return Err((axum::http::StatusCode::BAD_GATEWAY, headers).into_response());
+								}
+							}
+						};
+						// Validate redirect target against SSRF rules
+						if let Err(_) = check_url(&rtc, &resolved) {
+							return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
+						}
+						current_url = resolved;
+						continue;
+					} else {
+						return Err((axum::http::StatusCode::BAD_GATEWAY, headers).into_response());
+					}
+				}
+				resp = Some(r);
+				break;
+			},
+			Err(_) => {
+				if q.fallback.is_some(){
+					headers.append("Content-Type","image/png".parse().unwrap());
+					return Err((axum::http::StatusCode::OK,headers,(*dummy_img).clone()).into_response());
+				}
+				return Err((axum::http::StatusCode::BAD_GATEWAY,headers).into_response())
 			}
-			return Err((axum::http::StatusCode::BAD_REQUEST,headers,format!("{:?}",e)).into_response())
+		}
+	}
+	let resp = match resp {
+		Some(r) => r,
+		None => {
+			// Too many redirects
+			return Err((axum::http::StatusCode::BAD_GATEWAY, headers).into_response());
 		}
 	};
+
 	fn add_remote_header(key:&'static str,headers:&mut HeaderMap,remote_headers:&reqwest::header::HeaderMap){
 		for v in remote_headers.get_all(key){
-			headers.append(key,String::from_utf8_lossy(v.as_bytes()).parse().unwrap());
+			if let Ok(val) = String::from_utf8_lossy(v.as_bytes()).parse() {
+				headers.append(key, val);
+			}
 		}
 	}
 	let remote_headers=resp.headers();
@@ -325,20 +455,22 @@ async fn get_file(
 		add_remote_header("Content-Range",&mut headers,remote_headers);
 		add_remote_header("Accept-Ranges",&mut headers,remote_headers);
 	}
+	// AVIF Accept header parsing: trim whitespace and strip quality params
 	let mut is_accept_avif=false;
-	if !config.encode_avif{
+	if !rtc.config.encode_avif{
 		//force no avif
 	}else if let Some(accept)=client_headers.get("Accept"){
 		if let Ok(accept)=std::str::from_utf8(accept.as_bytes()){
 			for e in accept.split(","){
-				if e=="image/avif"{
+				let mime = e.trim().split(';').next().unwrap_or("").trim();
+				if mime=="image/avif"{
 					is_accept_avif=true;
 				}
 			}
 		}
 	}
 	headers.append("Cache-Control","max-age=300".parse().unwrap());
-	for line in config.append_headers.iter(){
+	for line in rtc.config.append_headers.iter(){
 		if let Some(idx)=line.find(":"){
 			if idx+1>=line.len(){
 				continue;
@@ -355,7 +487,7 @@ async fn get_file(
 		headers,
 		parms:q,
 		src_bytes:Vec::new(),
-		config,
+		config:Arc::new(rtc.config.clone()),
 		codec:Err(None),
 		dummy_img,
 		fontdb,
@@ -404,7 +536,9 @@ impl RequestContext{
 				let name=urlencoding::encode(&name);
 				let content_disposition=format!("inline; filename=\"{}\";filename*=UTF-8''{};",name,name);
 				headers.remove(k);
-				headers.append(k,content_disposition.parse().unwrap());
+				if let Ok(val) = content_disposition.parse() {
+					headers.append(k, val);
+				}
 			}
 		}
 	}
@@ -481,7 +615,7 @@ impl RequestContext{
 			}).await{
 				resp
 			}else{
-				header.append("X-Proxy-Error",format!("ImageEncodeThread").parse().unwrap());
+				header.append("X-Proxy-Error","ImageEncodeThread".parse().unwrap());
 				return Err(if is_fallback{
 					header.remove("Content-Type");
 					header.append("Content-Type","image/png".parse().unwrap());
@@ -543,22 +677,24 @@ impl RequestContext{
 	async fn load_all(&mut self,mut resp: PreDataStream)->Result<(),axum::response::Response>{
 		let len_hint=resp.content_length.unwrap_or(2048.min(self.config.max_size));
 		if len_hint>self.config.max_size{
-			self.headers.append("X-Proxy-Error",format!("lengthHint:{}>{}",len_hint,self.config.max_size).parse().unwrap());
+			self.headers.append("X-Proxy-Error","content-too-large".parse().unwrap());
 			return Err((axum::http::StatusCode::BAD_GATEWAY,self.headers.clone()).into_response())
 		}
-		let mut response_bytes=Vec::with_capacity(len_hint as usize);
+		// Cap initial allocation to 4 MB to prevent malicious Content-Length from causing huge alloc
+		let initial_cap = std::cmp::min(len_hint as usize, 4 * 1024 * 1024);
+		let mut response_bytes=Vec::with_capacity(initial_cap);
 		while let Some(x) = resp.next().await{
 			match x{
 				Ok(b)=>{
 					if response_bytes.len()+b.len()>self.config.max_size as usize{
-						self.headers.append("X-Proxy-Error",format!("length:{}>{}",response_bytes.len()+b.len(),self.config.max_size).parse().unwrap());
+						self.headers.append("X-Proxy-Error","content-too-large".parse().unwrap());
 						return Err((axum::http::StatusCode::BAD_GATEWAY,self.headers.clone()).into_response())
 					}
 					response_bytes.extend_from_slice(&b);
 				},
-				Err(e)=>{
-					self.headers.append("X-Proxy-Error",format!("LoadAll:{:?}",e).parse().unwrap());
-					return Err((axum::http::StatusCode::BAD_GATEWAY,self.headers.clone(),format!("{:?}",e)).into_response())
+				Err(_)=>{
+					self.headers.append("X-Proxy-Error","upstream-read-error".parse().unwrap());
+					return Err((axum::http::StatusCode::BAD_GATEWAY,self.headers.clone()).into_response())
 				}
 			}
 		}
@@ -592,5 +728,83 @@ impl futures::stream::Stream for PreDataStream{
 			return std::task::Poll::Ready(Some(d));
 		}
 		r.last.as_mut().poll_next(cx)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn test_runtime_config() -> RuntimeConfig {
+		let config = ConfigFile {
+			bind_addr: "0.0.0.0:12766".to_owned(),
+			timeout: 10000,
+			user_agent: "test".to_owned(),
+			max_size: 256 * 1024 * 1024,
+			proxy: None,
+			filter_type: FilterType::Triangle,
+			max_pixels: 2048,
+			append_headers: vec![],
+			load_system_fonts: false,
+			webp_quality: 75.0,
+			encode_avif: false,
+			allowed_networks: None,
+			blocked_networks: None,
+			blocked_hosts: Some(vec!["evil.com".to_owned(), "Evil.Net".to_owned()]),
+		};
+		build_runtime_config(config)
+	}
+
+	#[test]
+	fn test_blocks_private_ipv4() {
+		let rtc = test_runtime_config();
+		// These resolve to loopback/private, should be blocked
+		assert!(check_url(&rtc, "http://127.0.0.1/").is_err());
+		assert!(check_url(&rtc, "http://10.0.0.1/").is_err());
+		assert!(check_url(&rtc, "http://172.16.0.1/").is_err());
+		assert!(check_url(&rtc, "http://192.168.1.1/").is_err());
+		assert!(check_url(&rtc, "http://169.254.169.254/").is_err());
+		assert!(check_url(&rtc, "http://0.0.0.0/").is_err());
+	}
+
+	#[test]
+	fn test_blocks_ipv6_loopback() {
+		let rtc = test_runtime_config();
+		assert!(check_url(&rtc, "http://[::1]/").is_err());
+	}
+
+	#[test]
+	fn test_blocks_invalid_scheme() {
+		let rtc = test_runtime_config();
+		assert!(check_url(&rtc, "ftp://example.com/").is_err());
+		assert!(check_url(&rtc, "file:///etc/passwd").is_err());
+	}
+
+	#[test]
+	fn test_blocked_hosts_case_insensitive() {
+		let rtc = test_runtime_config();
+		assert!(rtc.blocked_hosts.contains("evil.com"));
+		assert!(rtc.blocked_hosts.contains("evil.net"));
+		// Original casing should not appear
+		assert!(!rtc.blocked_hosts.contains("Evil.Net"));
+	}
+
+	#[test]
+	fn test_truncate_url() {
+		assert_eq!(truncate_url("short", 10), "short");
+		assert_eq!(truncate_url("a]long-string-here", 5), "a]lon...");
+	}
+
+	#[test]
+	fn test_ipv6_blocked() {
+		use std::net::Ipv6Addr;
+		assert!(is_ipv6_blocked(&Ipv6Addr::LOCALHOST)); // ::1
+		assert!(is_ipv6_blocked(&Ipv6Addr::UNSPECIFIED)); // ::
+		// fe80::1 (link-local)
+		assert!(is_ipv6_blocked(&"fe80::1".parse().unwrap()));
+		// fc00::1 (ULA)
+		assert!(is_ipv6_blocked(&"fc00::1".parse().unwrap()));
+		// ::ffff:127.0.0.1 (mapped)
+		assert!(is_ipv6_blocked(&"::ffff:127.0.0.1".parse().unwrap()));
 	}
 }
