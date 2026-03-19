@@ -298,7 +298,9 @@ fn main() {
 	rt.block_on(async{
 		let app = Router::new();
 		let arg_tup0=arg_tup.clone();
+		let arg_tup_transform=arg_tup.clone();
 		let app=app.route("/",axum::routing::get(move|headers,parms|get_file(None,headers,arg_tup0.clone(),parms)));
+		let app=app.route("/transform",axum::routing::post(move|headers,multipart|post_transform(headers,arg_tup_transform.clone(),multipart)));
 		let app=app.route("/{*path}",axum::routing::get(move|path,headers,parms|get_file(Some(path),headers,arg_tup.clone(),parms)));
 		let bind_addr=&bind_addr;
 		if bind_addr.starts_with("/") || bind_addr.ends_with(".sock") {
@@ -395,6 +397,126 @@ fn truncate_url(url: &str, max_len: usize) -> String {
 
 /// Maximum number of redirects to follow manually
 const MAX_REDIRECTS: usize = 5;
+
+async fn post_transform(
+	client_headers:axum::http::HeaderMap,
+	(_client,rtc,dummy_img,fontdb,semaphore):(reqwest::Client,Arc<RuntimeConfig>,Arc<Vec<u8>>,Arc<resvg::usvg::fontdb::Database>,Arc<tokio::sync::Semaphore>),
+	mut multipart:axum::extract::Multipart,
+)->Result<(axum::http::StatusCode,HeaderMap,axum::body::Body),axum::response::Response>{
+	let _permit = semaphore.try_acquire().map_err(|_| {
+		(axum::http::StatusCode::SERVICE_UNAVAILABLE, HeaderMap::new()).into_response()
+	})?;
+	let max_size=rtc.config.max_size;
+	let mut file_bytes:Option<Vec<u8>>=None;
+	let mut avatar:Option<String>=None;
+	let mut emoji:Option<String>=None;
+	let mut preview:Option<String>=None;
+	let mut r#static:Option<String>=None;
+	let mut badge:Option<String>=None;
+	while let Ok(Some(field))=multipart.next_field().await{
+		let name=field.name().unwrap_or("").to_owned();
+		match name.as_str(){
+			"file"=>{
+				let bytes=field.bytes().await.map_err(|_|{
+					(axum::http::StatusCode::BAD_REQUEST,HeaderMap::new()).into_response()
+				})?;
+				if bytes.len() as u64>max_size{
+					let mut headers=HeaderMap::new();
+					headers.append("X-Proxy-Error","content-too-large".parse().unwrap());
+					return Err((axum::http::StatusCode::BAD_REQUEST,headers).into_response());
+				}
+				file_bytes=Some(bytes.to_vec());
+			},
+			"avatar"=>avatar=field.text().await.ok(),
+			"emoji"=>emoji=field.text().await.ok(),
+			"preview"=>preview=field.text().await.ok(),
+			"static"=>r#static=field.text().await.ok(),
+			"badge"=>badge=field.text().await.ok(),
+			_=>{}
+		}
+	}
+	let src_bytes=match file_bytes{
+		Some(b) if !b.is_empty()=>b,
+		_=>return Err((axum::http::StatusCode::BAD_REQUEST,HeaderMap::new()).into_response()),
+	};
+	println!("{}\ttransform\tsize:{}\tavatar:{:?}\tpreview:{:?}\tbadge:{:?}\temoji:{:?}\tstatic:{:?}",
+		chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+		src_bytes.len(),
+		avatar,
+		preview,
+		badge,
+		emoji,
+		r#static,
+	);
+	let parms=RequestParams{
+		url:String::new(),
+		r#static,
+		emoji,
+		avatar,
+		preview,
+		badge,
+		fallback:None,
+	};
+	// Detect format from bytes
+	let is_svg=std::str::from_utf8(&src_bytes).map(|s|s.trim().starts_with("<svg")).unwrap_or(false);
+	let codec=image::guess_format(&src_bytes).map_err(|e|Some(e));
+	// Parse Accept header for AVIF
+	let mut is_accept_avif=false;
+	if rtc.config.encode_avif{
+		if let Some(accept)=client_headers.get("Accept"){
+			if let Ok(accept)=std::str::from_utf8(accept.as_bytes()){
+				for e in accept.split(","){
+					let mime=e.trim().split(';').next().unwrap_or("").trim();
+					if mime=="image/avif"{
+						is_accept_avif=true;
+					}
+				}
+			}
+		}
+	}
+	let mut headers=HeaderMap::new();
+	headers.append("Cache-Control","no-cache".parse().unwrap());
+	for line in rtc.config.append_headers.iter(){
+		if let Some(idx)=line.find(":"){
+			if idx+1>=line.len(){ continue; }
+			if let Ok(k)=axum::http::HeaderName::from_str(&line[0..idx]){
+				if let Ok(v)=line[idx+1..].parse(){
+					headers.append(k,v);
+				}
+			}
+		}
+	}
+	let mut ctx=RequestContext{
+		is_accept_avif,
+		headers,
+		parms,
+		src_bytes,
+		config:Arc::new(rtc.config.clone()),
+		codec,
+		dummy_img,
+		fontdb:fontdb.clone(),
+	};
+	if is_svg{
+		if let Ok(img)=ctx.encode_svg(fontdb){
+			ctx.headers.remove("Cache-Control");
+			return Err(ctx.response_img(img));
+		}else{
+			return Err((axum::http::StatusCode::OK,ctx.headers.clone(),ctx.src_bytes.clone()).into_response());
+		}
+	}
+	// Image encoding in blocking thread
+	let header=ctx.headers.clone();
+	let resp=if let Ok(resp)=tokio::runtime::Handle::current().spawn_blocking(move||{
+		ctx.encode_img()
+	}).await{
+		resp
+	}else{
+		let mut h=header;
+		h.append("X-Proxy-Error","ImageEncodeThread".parse().unwrap());
+		return Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR,h).into_response());
+	};
+	Err(resp)
+}
 
 async fn get_file(
 	_path:Option<axum::extract::Path<String>>,
