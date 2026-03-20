@@ -8,6 +8,53 @@
 docker run -itd -p 12766:12766 ghcr.io/yojo-art/media-proxy-rs:main
 ```
 
+### Unix Domain Socket(UDS)で利用する場合
+`config.json`の`bind_addr`を`/`で始まるパスまたは`.sock`で終わるパスに設定するとUDSモードで起動します
+nginxなどのリバースプロキシと同じボリュームを共有してソケットファイル経由で通信できます
+
+config.json:
+```json
+{
+  "bind_addr": "/run/media-proxy-rs/media-proxy.sock"
+}
+```
+
+docker-compose.yml:
+```yaml
+services:
+  media-proxy:
+    image: ghcr.io/yojo-art/media-proxy-rs:main
+    volumes:
+      - media-proxy-sock:/run/media-proxy-rs
+      - ./config.json:/media-proxy-rs/config.json:ro
+
+  nginx:
+    image: nginx:stable-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - media-proxy-sock:/run/media-proxy-rs
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
+volumes:
+  media-proxy-sock:
+```
+
+nginx.conf:
+```nginx
+upstream media-proxy {
+    server unix:/run/media-proxy-rs/media-proxy.sock;
+}
+server {
+    listen 80;
+    location / {
+        proxy_pass http://media-proxy;
+    }
+}
+```
+
+コンテナ内のユーザーはUID=852(proxy)で動作するため、ソケットディレクトリの権限に注意してください
+
 ## 実行(Linux)
 例(x86_64/amd64)
 ```
