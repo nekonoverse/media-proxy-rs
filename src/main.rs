@@ -87,8 +87,24 @@ pub struct ConfigFile{
 	blocked_hosts:Option<Vec<String>>,
 	#[serde(default="default_max_concurrent")]
 	max_concurrent:u32,
+	#[serde(default)]
+	variant_sizes:VariantSizes,
 }
 fn default_max_concurrent()->u32{ 64 }
+
+#[derive(Clone,Debug,Serialize,Deserialize)]
+pub struct VariantSize{
+	pub width:Option<u32>,
+	pub height:Option<u32>,
+}
+#[derive(Clone,Debug,Default,Serialize,Deserialize)]
+pub struct VariantSizes{
+	pub avatar:Option<VariantSize>,
+	pub emoji:Option<VariantSize>,
+	pub preview:Option<VariantSize>,
+	pub badge:Option<VariantSize>,
+	pub r#static:Option<VariantSize>,
+}
 
 /// Pre-parsed runtime config (parsed once at startup, shared via Arc)
 pub struct RuntimeConfig{
@@ -245,6 +261,7 @@ fn main() {
 			blocked_networks:None,
 			blocked_hosts:None,
 			max_concurrent:64,
+			variant_sizes:VariantSizes::default(),
 		};
 		let default_config=serde_json::to_string_pretty(&default_config).expect("serialize default config");
 		std::fs::File::create(&config_path).expect("create default config.json").write_all(default_config.as_bytes()).expect("write default config");

@@ -6,20 +6,31 @@ use crate::RequestContext;
 
 impl RequestContext{
 	pub(crate) fn image_size_hint(&self)->(u32,u32){
+		let vs=&self.config.variant_sizes;
 		if self.parms.badge.is_some(){
-			return (96,96);
+			return vs.badge.as_ref()
+				.map(|v|(v.width.unwrap_or(u32::MAX),v.height.unwrap_or(u32::MAX)))
+				.unwrap_or((96,96));
 		}
 		if self.parms.r#static.is_some(){
-			return (498,422);
+			return vs.r#static.as_ref()
+				.map(|v|(v.width.unwrap_or(u32::MAX),v.height.unwrap_or(u32::MAX)))
+				.unwrap_or((498,422));
 		}
 		if self.parms.emoji.is_some(){
-			return (u32::MAX,128);
+			return vs.emoji.as_ref()
+				.map(|v|(v.width.unwrap_or(u32::MAX),v.height.unwrap_or(u32::MAX)))
+				.unwrap_or((u32::MAX,128));
 		}
 		if self.parms.preview.is_some(){
-			return (200,200);
+			return vs.preview.as_ref()
+				.map(|v|(v.width.unwrap_or(u32::MAX),v.height.unwrap_or(u32::MAX)))
+				.unwrap_or((200,200));
 		}
 		if self.parms.avatar.is_some(){
-			return (u32::MAX,320);
+			return vs.avatar.as_ref()
+				.map(|v|(v.width.unwrap_or(u32::MAX),v.height.unwrap_or(u32::MAX)))
+				.unwrap_or((u32::MAX,320));
 		}
 		(self.config.max_pixels,self.config.max_pixels)
 	}
