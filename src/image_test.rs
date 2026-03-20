@@ -56,6 +56,7 @@ fn test_config() -> std::sync::Arc<crate::ConfigFile> {
 		blocked_networks: None,
 		blocked_hosts: None,
 		max_concurrent: 64,
+		variant_sizes: crate::VariantSizes::default(),
 	})
 }
 
@@ -151,6 +152,93 @@ fn test_image_size_hint_badge_priority() {
 	let ctx = test_request_context(parms);
 	// badge is checked first
 	assert_eq!(ctx.image_size_hint(), (96, 96));
+}
+
+// --- custom variant_sizes tests ---
+
+#[cfg(test)]
+fn test_config_with_variant_sizes(vs: crate::VariantSizes) -> std::sync::Arc<crate::ConfigFile> {
+	let mut config = (*test_config()).clone();
+	config.variant_sizes = vs;
+	std::sync::Arc::new(config)
+}
+
+#[cfg(test)]
+fn test_request_context_with_config(parms: crate::RequestParams, config: std::sync::Arc<crate::ConfigFile>) -> crate::RequestContext {
+	let mut fontdb = resvg::usvg::fontdb::Database::new();
+	fontdb.load_font_source(resvg::usvg::fontdb::Source::Binary(std::sync::Arc::new(
+		include_bytes!("../asset/font/Aileron-Light.otf"),
+	)));
+	crate::RequestContext {
+		is_accept_avif: false,
+		headers: axum::http::HeaderMap::new(),
+		parms,
+		src_bytes: Vec::new(),
+		config,
+		codec: Err(None),
+		dummy_img: std::sync::Arc::new(include_bytes!("../asset/dummy.png").to_vec()),
+		fontdb: std::sync::Arc::new(fontdb),
+	}
+}
+
+#[test]
+fn test_image_size_hint_custom_badge() {
+	let vs = crate::VariantSizes {
+		badge: Some(crate::VariantSize { width: Some(64), height: Some(64) }),
+		..Default::default()
+	};
+	let mut parms = default_parms();
+	parms.badge = Some("1".to_owned());
+	let ctx = test_request_context_with_config(parms, test_config_with_variant_sizes(vs));
+	assert_eq!(ctx.image_size_hint(), (64, 64));
+}
+
+#[test]
+fn test_image_size_hint_custom_avatar_null_width() {
+	let vs = crate::VariantSizes {
+		avatar: Some(crate::VariantSize { width: None, height: Some(256) }),
+		..Default::default()
+	};
+	let mut parms = default_parms();
+	parms.avatar = Some("1".to_owned());
+	let ctx = test_request_context_with_config(parms, test_config_with_variant_sizes(vs));
+	assert_eq!(ctx.image_size_hint(), (u32::MAX, 256));
+}
+
+#[test]
+fn test_image_size_hint_custom_emoji() {
+	let vs = crate::VariantSizes {
+		emoji: Some(crate::VariantSize { width: Some(64), height: Some(64) }),
+		..Default::default()
+	};
+	let mut parms = default_parms();
+	parms.emoji = Some("1".to_owned());
+	let ctx = test_request_context_with_config(parms, test_config_with_variant_sizes(vs));
+	assert_eq!(ctx.image_size_hint(), (64, 64));
+}
+
+#[test]
+fn test_image_size_hint_custom_preview() {
+	let vs = crate::VariantSizes {
+		preview: Some(crate::VariantSize { width: Some(400), height: Some(400) }),
+		..Default::default()
+	};
+	let mut parms = default_parms();
+	parms.preview = Some("1".to_owned());
+	let ctx = test_request_context_with_config(parms, test_config_with_variant_sizes(vs));
+	assert_eq!(ctx.image_size_hint(), (400, 400));
+}
+
+#[test]
+fn test_image_size_hint_custom_static() {
+	let vs = crate::VariantSizes {
+		r#static: Some(crate::VariantSize { width: Some(1024), height: Some(768) }),
+		..Default::default()
+	};
+	let mut parms = default_parms();
+	parms.r#static = Some("1".to_owned());
+	let ctx = test_request_context_with_config(parms, test_config_with_variant_sizes(vs));
+	assert_eq!(ctx.image_size_hint(), (1024, 768));
 }
 
 // --- resize() method tests ---

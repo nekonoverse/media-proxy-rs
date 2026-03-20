@@ -12,5 +12,12 @@
   ],
   "load_system_fonts": true,
   "webp_quality": 75.0,
-  "encode_avif": false
+  "encode_avif": false,
+  "variant_sizes": {
+    "avatar":  { "width": null, "height": 320 },
+    "emoji":   { "width": null, "height": 128 },
+    "preview": { "width": 200,  "height": 200 },
+    "badge":   { "width": 96,   "height": 96  },
+    "static":  { "width": 498,  "height": 422 }
+  }
 }
