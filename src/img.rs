@@ -391,7 +391,7 @@ impl RequestContext{
 	}
 }
 
-fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:jpegxr::PixelFormat)->Option<DynamicImage>{
+pub(crate) fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:jpegxr::PixelFormat)->Option<DynamicImage>{
 	let buf_len = buffer.len();
 	// Validate minimum buffer size for stride-based formats
 	let required_size = if height > 0 { (height as usize - 1) * stride } else { 0 };
@@ -482,7 +482,7 @@ pub fn image_to_frame(image: &DynamicImage, timestamp: i32) -> Result<webp::Anim
 		_ => Err("Unimplemented"),
 	}
 }
-fn resize(img:DynamicImage,max_width:u32,max_height:u32,filter:fast_image_resize::FilterType)->Option<DynamicImage>{
+pub(crate) fn resize(img:DynamicImage,max_width:u32,max_height:u32,filter:fast_image_resize::FilterType)->Option<DynamicImage>{
 	let scale = f32::min(max_width as f32 / img.width() as f32,max_height as f32 / img.height() as f32);
 	let dst_width=1.max((img.width() as f32 * scale).round() as u32);
 	let dst_height=1.max((img.height() as f32 * scale).round() as u32);
