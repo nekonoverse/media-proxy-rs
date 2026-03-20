@@ -1,5 +1,7 @@
 use core::str;
 use std::{collections::HashSet, io::Write, net::SocketAddr, pin::Pin, str::FromStr, sync::Arc};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use axum::{http::HeaderMap, response::IntoResponse, Router};
 use iprange::IpRange;
@@ -310,6 +312,8 @@ fn main() {
 				std::fs::remove_file(path).expect("failed to remove existing socket file");
 			}
 			let listener=tokio::net::UnixListener::bind(path).expect("failed to bind unix socket");
+			// Allow other users (e.g. app running as uid 101) to connect
+			std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o666)).expect("failed to chmod socket");
 			println!("Listening on unix:{}",bind_addr);
 			axum::serve(listener,app.into_make_service()).with_graceful_shutdown(shutdown_signal()).await.expect("serve failed");
 			// Clean up socket on shutdown
