@@ -125,6 +125,7 @@ pub struct RequestParams{
 	preview:Option<String>,
 	badge:Option<String>,
 	fallback:Option<String>,
+	#[serde(skip_deserializing)]
 	no_resize:Option<String>,
 }
 #[derive(Clone, Copy,Debug,Serialize,Deserialize)]
