@@ -89,6 +89,8 @@ pub struct ConfigFile{
 	max_concurrent:u32,
 	#[serde(default)]
 	variant_sizes:VariantSizes,
+	#[serde(default)]
+	enable_transform:bool,
 }
 fn default_max_concurrent()->u32{ 64 }
 
@@ -317,12 +319,20 @@ fn main() {
 	let semaphore=Arc::new(tokio::sync::Semaphore::new(runtime_config.config.max_concurrent as usize));
 	let arg_tup=(client,runtime_config,dummy_png,fontdb,semaphore);
 	rt.block_on(async{
+		let enable_transform=arg_tup.1.config.enable_transform;
 		let app = Router::new();
 		let arg_tup0=arg_tup.clone();
-		let arg_tup_transform=arg_tup.clone();
 		let app=app.route("/",axum::routing::get(move|headers,parms|get_file(None,headers,arg_tup0.clone(),parms)));
-		let app=app.route("/transform",axum::routing::post(move|headers,multipart|post_transform(headers,arg_tup_transform.clone(),multipart)));
+		let app=if enable_transform{
+			let arg_tup_transform=arg_tup.clone();
+			app.route("/transform",axum::routing::post(move|headers,multipart|post_transform(headers,arg_tup_transform.clone(),multipart)))
+		}else{
+			app
+		};
 		let app=app.route("/{*path}",axum::routing::get(move|path,headers,parms|get_file(Some(path),headers,arg_tup.clone(),parms)));
+		if enable_transform{
+			println!("POST /transform endpoint enabled");
+		}
 		let bind_addr=&bind_addr;
 		if bind_addr.starts_with("/") || bind_addr.ends_with(".sock") {
 			// Unix domain socket mode
