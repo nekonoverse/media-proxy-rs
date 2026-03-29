@@ -57,6 +57,7 @@ fn test_config() -> std::sync::Arc<crate::ConfigFile> {
 		blocked_hosts: None,
 		max_concurrent: 64,
 		variant_sizes: crate::VariantSizes::default(),
+		enable_transform: false,
 	})
 }
 

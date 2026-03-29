@@ -89,6 +89,8 @@ pub struct ConfigFile{
 	max_concurrent:u32,
 	#[serde(default)]
 	variant_sizes:VariantSizes,
+	#[serde(default)]
+	enable_transform:bool,
 }
 fn default_max_concurrent()->u32{ 64 }
 
@@ -125,6 +127,8 @@ pub struct RequestParams{
 	preview:Option<String>,
 	badge:Option<String>,
 	fallback:Option<String>,
+	#[serde(skip_deserializing)]
+	no_resize:Option<String>,
 }
 #[derive(Clone, Copy,Debug,Serialize,Deserialize)]
 enum FilterType{
@@ -262,6 +266,7 @@ fn main() {
 			blocked_hosts:None,
 			max_concurrent:64,
 			variant_sizes:VariantSizes::default(),
+			enable_transform:false,
 		};
 		let default_config=serde_json::to_string_pretty(&default_config).expect("serialize default config");
 		std::fs::File::create(&config_path).expect("create default config.json").write_all(default_config.as_bytes()).expect("write default config");
@@ -315,12 +320,20 @@ fn main() {
 	let semaphore=Arc::new(tokio::sync::Semaphore::new(runtime_config.config.max_concurrent as usize));
 	let arg_tup=(client,runtime_config,dummy_png,fontdb,semaphore);
 	rt.block_on(async{
+		let enable_transform=arg_tup.1.config.enable_transform;
 		let app = Router::new();
 		let arg_tup0=arg_tup.clone();
-		let arg_tup_transform=arg_tup.clone();
 		let app=app.route("/",axum::routing::get(move|headers,parms|get_file(None,headers,arg_tup0.clone(),parms)));
-		let app=app.route("/transform",axum::routing::post(move|headers,multipart|post_transform(headers,arg_tup_transform.clone(),multipart)));
+		let app=if enable_transform{
+			let arg_tup_transform=arg_tup.clone();
+			app.route("/transform",axum::routing::post(move|headers,multipart|post_transform(headers,arg_tup_transform.clone(),multipart)))
+		}else{
+			app
+		};
 		let app=app.route("/{*path}",axum::routing::get(move|path,headers,parms|get_file(Some(path),headers,arg_tup.clone(),parms)));
+		if enable_transform{
+			println!("POST /transform endpoint enabled");
+		}
 		let bind_addr=&bind_addr;
 		if bind_addr.starts_with("/") || bind_addr.ends_with(".sock") {
 			// Unix domain socket mode
@@ -434,6 +447,7 @@ async fn post_transform(
 	let mut preview:Option<String>=None;
 	let mut r#static:Option<String>=None;
 	let mut badge:Option<String>=None;
+	let mut no_resize:Option<String>=None;
 	while let Ok(Some(field))=multipart.next_field().await{
 		let name=field.name().unwrap_or("").to_owned();
 		match name.as_str(){
@@ -453,6 +467,7 @@ async fn post_transform(
 			"preview"=>preview=field.text().await.ok(),
 			"static"=>r#static=field.text().await.ok(),
 			"badge"=>badge=field.text().await.ok(),
+			"no_resize"=>no_resize=field.text().await.ok(),
 			_=>{}
 		}
 	}
@@ -477,6 +492,7 @@ async fn post_transform(
 		preview,
 		badge,
 		fallback:None,
+		no_resize,
 	};
 	// Detect format from bytes
 	let is_svg=std::str::from_utf8(&src_bytes).map(|s|s.trim().starts_with("<svg")).unwrap_or(false);
@@ -976,6 +992,8 @@ mod tests {
 			blocked_networks: None,
 			blocked_hosts: Some(vec!["evil.com".to_owned(), "Evil.Net".to_owned()]),
 			max_concurrent: 64,
+			variant_sizes: VariantSizes::default(),
+			enable_transform: false,
 		};
 		build_runtime_config(config)
 	}
@@ -1056,6 +1074,8 @@ mod tests {
 			blocked_networks: blocked,
 			blocked_hosts,
 			max_concurrent: 64,
+			variant_sizes: VariantSizes::default(),
+			enable_transform: false,
 		}
 	}
 
@@ -1292,6 +1312,75 @@ mod tests {
 		assert_eq!(config2.timeout, config.timeout);
 		assert_eq!(config2.max_pixels, config.max_pixels);
 		assert_eq!(config2.max_concurrent, config.max_concurrent);
+	}
+
+	// --- enable_transform tests ---
+
+	#[test]
+	fn test_config_enable_transform_defaults_to_false() {
+		// enable_transform を省略した場合、デフォルトで false になること
+		let json = r#"{
+			"bind_addr": "0.0.0.0:12766",
+			"timeout": 10000,
+			"user_agent": "test",
+			"max_size": 268435456,
+			"proxy": null,
+			"filter_type": "Triangle",
+			"max_pixels": 2048,
+			"append_headers": [],
+			"load_system_fonts": false,
+			"webp_quality": 75.0,
+			"encode_avif": false
+		}"#;
+		let config: ConfigFile = serde_json::from_str(json).unwrap();
+		assert!(!config.enable_transform);
+	}
+
+	#[test]
+	fn test_config_enable_transform_explicit_true() {
+		let json = r#"{
+			"bind_addr": "0.0.0.0:12766",
+			"timeout": 10000,
+			"user_agent": "test",
+			"max_size": 268435456,
+			"proxy": null,
+			"filter_type": "Triangle",
+			"max_pixels": 2048,
+			"append_headers": [],
+			"load_system_fonts": false,
+			"webp_quality": 75.0,
+			"encode_avif": false,
+			"enable_transform": true
+		}"#;
+		let config: ConfigFile = serde_json::from_str(json).unwrap();
+		assert!(config.enable_transform);
+	}
+
+	#[test]
+	fn test_no_resize_not_deserialized_from_query() {
+		// skip_deserializing により、クエリパラメータから no_resize が設定されないこと
+		let json = r#"{
+			"url": "http://example.com/img.jpg",
+			"no_resize": "1"
+		}"#;
+		let parms: RequestParams = serde_json::from_str(json).unwrap();
+		assert!(parms.no_resize.is_none());
+	}
+
+	#[test]
+	fn test_no_resize_can_be_set_directly() {
+		// struct 直接構築では no_resize を設定できること (post_transform の動作)
+		let parms = RequestParams {
+			url: String::new(),
+			r#static: None,
+			emoji: None,
+			avatar: None,
+			preview: None,
+			badge: None,
+			fallback: None,
+			no_resize: Some("1".to_owned()),
+		};
+		assert!(parms.no_resize.is_some());
 	}
 
 	// --- FilterType conversion tests ---
