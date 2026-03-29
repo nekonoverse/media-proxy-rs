@@ -125,6 +125,7 @@ pub struct RequestParams{
 	preview:Option<String>,
 	badge:Option<String>,
 	fallback:Option<String>,
+	no_resize:Option<String>,
 }
 #[derive(Clone, Copy,Debug,Serialize,Deserialize)]
 enum FilterType{
@@ -434,6 +435,7 @@ async fn post_transform(
 	let mut preview:Option<String>=None;
 	let mut r#static:Option<String>=None;
 	let mut badge:Option<String>=None;
+	let mut no_resize:Option<String>=None;
 	while let Ok(Some(field))=multipart.next_field().await{
 		let name=field.name().unwrap_or("").to_owned();
 		match name.as_str(){
@@ -453,6 +455,7 @@ async fn post_transform(
 			"preview"=>preview=field.text().await.ok(),
 			"static"=>r#static=field.text().await.ok(),
 			"badge"=>badge=field.text().await.ok(),
+			"no_resize"=>no_resize=field.text().await.ok(),
 			_=>{}
 		}
 	}
@@ -477,6 +480,7 @@ async fn post_transform(
 		preview,
 		badge,
 		fallback:None,
+		no_resize,
 	};
 	// Detect format from bytes
 	let is_svg=std::str::from_utf8(&src_bytes).map(|s|s.trim().starts_with("<svg")).unwrap_or(false);

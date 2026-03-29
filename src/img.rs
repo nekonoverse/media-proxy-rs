@@ -35,6 +35,9 @@ impl RequestContext{
 		(self.config.max_pixels,self.config.max_pixels)
 	}
 	pub(crate) fn resize(&self,img:DynamicImage)->Option<DynamicImage>{
+		if self.parms.no_resize.is_some(){
+			return Some(img);
+		}
 		let (width,height)=self.image_size_hint();
 		if self.parms.badge.is_some(){
 			let img=if img.dimensions()==(width,height){
