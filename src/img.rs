@@ -416,16 +416,16 @@ pub(crate) fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:j
 		jpegxr::PixelFormat::PixelFormat24bppBGR => {
 			let end = required_size + width as usize * 3;
 			if buf_len < end { return None; }
-			let mut rgb=Vec::with_capacity((width*height*3) as usize);
+			let mut buffer=buffer;
 			for y in 0..height{
 				for x in 0..width{
 					let offset=y as usize*stride+x as usize*3;
-					rgb.push(buffer[offset+2]); // R
-					rgb.push(buffer[offset+1]); // G
-					rgb.push(buffer[offset]);   // B
+					let r=buffer[offset];
+					buffer[offset]=buffer[offset+2];
+					buffer[offset+2]=r;
 				}
 			}
-			image::ImageBuffer::from_raw(width,height,rgb).map(|i|DynamicImage::ImageRgb8(i))
+			image::ImageBuffer::from_raw(width,height,buffer).map(|i|DynamicImage::ImageRgb8(i))
 		},
 		jpegxr::PixelFormat::PixelFormat24bppRGB => {
 			image::ImageBuffer::from_raw(width,height,buffer).map(|i|DynamicImage::ImageRgb8(i))
@@ -433,12 +433,13 @@ pub(crate) fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:j
 		jpegxr::PixelFormat::PixelFormat32bppBGR => {
 			let end = required_size + width as usize * 4 + 2;
 			if buf_len < end { return None; }
-			let mut raw_img=Vec::with_capacity((width as usize)*(height as usize)*3);
+			let mut raw_img=Vec::with_capacity(width as usize*height as usize*3);
 			for y in 0..height{
 				for x in 0..width{
-					raw_img.push(buffer[y as usize*stride+x as usize*4+2]);
-					raw_img.push(buffer[y as usize*stride+x as usize*4+1]);
-					raw_img.push(buffer[y as usize*stride+x as usize*4+0]);
+					let offset=y as usize*stride+x as usize*4;
+					raw_img.push(buffer[offset+2]);
+					raw_img.push(buffer[offset+1]);
+					raw_img.push(buffer[offset+0]);
 				}
 			}
 			image::ImageBuffer::from_raw(width,height,raw_img).map(|i|DynamicImage::ImageRgb8(i))
@@ -451,7 +452,7 @@ pub(crate) fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:j
 				for x in 0..width{
 					let offset=y as usize*stride+x as usize*4;
 					let r=buffer[offset];
-					buffer[y as usize*stride+x as usize*4]=buffer[offset+2];
+					buffer[offset]=buffer[offset+2];
 					buffer[offset+2]=r;
 				}
 			}
@@ -463,9 +464,10 @@ pub(crate) fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:j
 			let mut raw_img=Vec::with_capacity((width as usize)*(height as usize)*3);
 			for y in 0..height{
 				for x in 0..width{
-					raw_img.push(buffer[y as usize*stride+x as usize*4+0]);
-					raw_img.push(buffer[y as usize*stride+x as usize*4+1]);
-					raw_img.push(buffer[y as usize*stride+x as usize*4+2]);
+					let offset=y as usize*stride+x as usize*4;
+					raw_img.push(buffer[offset+0]);
+					raw_img.push(buffer[offset+1]);
+					raw_img.push(buffer[offset+2]);
 				}
 			}
 			image::ImageBuffer::from_raw(width,height,raw_img).map(|i|DynamicImage::ImageRgb8(i))
