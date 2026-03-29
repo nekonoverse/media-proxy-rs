@@ -266,6 +266,7 @@ fn main() {
 			blocked_hosts:None,
 			max_concurrent:64,
 			variant_sizes:VariantSizes::default(),
+			enable_transform:false,
 		};
 		let default_config=serde_json::to_string_pretty(&default_config).expect("serialize default config");
 		std::fs::File::create(&config_path).expect("create default config.json").write_all(default_config.as_bytes()).expect("write default config");
@@ -991,6 +992,8 @@ mod tests {
 			blocked_networks: None,
 			blocked_hosts: Some(vec!["evil.com".to_owned(), "Evil.Net".to_owned()]),
 			max_concurrent: 64,
+			variant_sizes: VariantSizes::default(),
+			enable_transform: false,
 		};
 		build_runtime_config(config)
 	}
@@ -1071,6 +1074,8 @@ mod tests {
 			blocked_networks: blocked,
 			blocked_hosts,
 			max_concurrent: 64,
+			variant_sizes: VariantSizes::default(),
+			enable_transform: false,
 		}
 	}
 
