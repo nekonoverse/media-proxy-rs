@@ -1314,6 +1314,75 @@ mod tests {
 		assert_eq!(config2.max_concurrent, config.max_concurrent);
 	}
 
+	// --- enable_transform tests ---
+
+	#[test]
+	fn test_config_enable_transform_defaults_to_false() {
+		// enable_transform を省略した場合、デフォルトで false になること
+		let json = r#"{
+			"bind_addr": "0.0.0.0:12766",
+			"timeout": 10000,
+			"user_agent": "test",
+			"max_size": 268435456,
+			"proxy": null,
+			"filter_type": "Triangle",
+			"max_pixels": 2048,
+			"append_headers": [],
+			"load_system_fonts": false,
+			"webp_quality": 75.0,
+			"encode_avif": false
+		}"#;
+		let config: ConfigFile = serde_json::from_str(json).unwrap();
+		assert!(!config.enable_transform);
+	}
+
+	#[test]
+	fn test_config_enable_transform_explicit_true() {
+		let json = r#"{
+			"bind_addr": "0.0.0.0:12766",
+			"timeout": 10000,
+			"user_agent": "test",
+			"max_size": 268435456,
+			"proxy": null,
+			"filter_type": "Triangle",
+			"max_pixels": 2048,
+			"append_headers": [],
+			"load_system_fonts": false,
+			"webp_quality": 75.0,
+			"encode_avif": false,
+			"enable_transform": true
+		}"#;
+		let config: ConfigFile = serde_json::from_str(json).unwrap();
+		assert!(config.enable_transform);
+	}
+
+	#[test]
+	fn test_no_resize_not_deserialized_from_query() {
+		// skip_deserializing により、クエリパラメータから no_resize が設定されないこと
+		let json = r#"{
+			"url": "http://example.com/img.jpg",
+			"no_resize": "1"
+		}"#;
+		let parms: RequestParams = serde_json::from_str(json).unwrap();
+		assert!(parms.no_resize.is_none());
+	}
+
+	#[test]
+	fn test_no_resize_can_be_set_directly() {
+		// struct 直接構築では no_resize を設定できること (post_transform の動作)
+		let parms = RequestParams {
+			url: String::new(),
+			r#static: None,
+			emoji: None,
+			avatar: None,
+			preview: None,
+			badge: None,
+			fallback: None,
+			no_resize: Some("1".to_owned()),
+		};
+		assert!(parms.no_resize.is_some());
+	}
+
 	// --- FilterType conversion tests ---
 
 	#[test]
