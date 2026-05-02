@@ -36,15 +36,31 @@ COPY asset ./asset
 COPY examples ./examples
 RUN --mount=type=cache,target=/var/cache/cargo --mount=type=cache,target=/app/target bash /app/crossfiles/build.sh
 
-FROM public.ecr.aws/docker/library/alpine:latest
-ARG UID="852"
-ARG GID="852"
-RUN addgroup -g "${GID}" proxy && adduser -u "${UID}" -G proxy -D -h /media-proxy-rs -s /bin/sh proxy
-WORKDIR /media-proxy-rs
-USER proxy
+# smoke test stage: runtime が distroless (shell なし) なのでビルド時自己テストは別ステージで実行する。
+# プラットフォーム指定なし = TARGETPLATFORM、buildx + QEMU 経由で cross-emulation される。
+FROM public.ecr.aws/docker/library/alpine:latest AS smoke_test
+WORKDIR /test
 COPY --from=build_app /app/media-proxy-rs ./media-proxy-rs
 COPY --from=build_app /app/healthcheck ./healthcheck
-RUN sh -c "MEDIA_PROXY_ALLOWED_NETWORKS=127.0.0.0/8 ./media-proxy-rs&" && ./healthcheck 12887 http://127.0.0.1:12766/test.webp
-HEALTHCHECK --interval=30s --timeout=3s CMD ./healthcheck 5555 http://127.0.0.1:12766/test.webp || exit 1
+RUN sh -c "MEDIA_PROXY_ALLOWED_NETWORKS=127.0.0.0/8 ./media-proxy-rs&" && ./healthcheck 12887 http://127.0.0.1:12766/test.webp && touch /test/passed
+
+# runtime stage 用の rootfs を 852 所有でステージングする (distroless には mkdir/chown が無く、
+# COPY の --chown も dest dir auto-create には効かないため、build stage で完全な階層構造を組む)。
+# original alpine 版で adduser -h /media-proxy-rs が果たしていた役割と同じ。
+FROM --platform=$BUILDPLATFORM cross_build AS runtime_home
+RUN mkdir -p /rootfs/media-proxy-rs
+COPY --from=build_app /app/media-proxy-rs /rootfs/media-proxy-rs/media-proxy-rs
+COPY --from=build_app /app/healthcheck /rootfs/media-proxy-rs/healthcheck
+RUN chown -R 852:852 /rootfs/media-proxy-rs && chmod 755 /rootfs/media-proxy-rs/media-proxy-rs /rootfs/media-proxy-rs/healthcheck
+
+# runtime: gcr.io/distroless/static-debian13 (CA certs + tzdata + libc-stub のみ、約 2MB)
+FROM gcr.io/distroless/static-debian13:latest
+# rootfs まるごと / に展開すると /media-proxy-rs ディレクトリの ownership (852:852) も保持される
+COPY --from=runtime_home /rootfs/ /
+# smoke test stage の成果物を取り込むことでテスト失敗時にビルドを失敗させる
+COPY --from=smoke_test /test/passed /etc/smoke-passed
+WORKDIR /media-proxy-rs
+USER 852:852
+HEALTHCHECK --interval=30s --timeout=3s CMD ["./healthcheck", "5555", "http://127.0.0.1:12766/test.webp"]
 EXPOSE 12766
 CMD ["./media-proxy-rs"]
