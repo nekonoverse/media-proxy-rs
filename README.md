@@ -64,13 +64,13 @@ chmod u+x ./media-proxy-rs
 ```
 利用するプラットフォームに応じて適切なバイナリを選択してください。ファイル名のリストを示します
 ```
-media-proxy-rs_linux-386.gz (i686+sse2)
 media-proxy-rs_linux-amd64.gz (x86-64-v3)
-media-proxy-rs_linux-arm-v6.gz
 media-proxy-rs_linux-arm-v7.gz
 media-proxy-rs_linux-arm64.gz
 media-proxy-rs_linux-riscv64.gz
 ```
+
+> Docker イメージは `gcr.io/distroless/static-debian13` ベースに移行したため、shell や `docker exec sh` が使えません。トラブル時はファイルシステム確認に `docker create <image> && docker export <cid> | tar -tvf -` などを利用してください。
 
 ## 設定ファイル
 環境変数`MEDIA_PROXY_CONFIG_PATH`を設定する事でファイルの場所を指定できます  
@@ -81,9 +81,9 @@ media-proxy-rs_linux-riscv64.gz
 - [x] x86_64-unknown-linux-musl
 - [x] aarch64-unknown-linux-musl
 - [x] armv7-unknown-linux-musleabihf
-- [x] arm-unknown-linux-musleabihf
-- [x] i686-unknown-linux-musl
 - [x] riscv64gc-unknown-linux-musl
+
+(Docker runtime base が distroless/static-debian13 になったため、`i686-unknown-linux-musl` / `arm-unknown-linux-musleabihf` のターゲットは Docker イメージとしては配布していません)
 
 ## ビルド(x64 Docker)
 Dockerを使用する場合はbuildxとqemuによるクロスコンパイルが利用できます  
