@@ -38,10 +38,13 @@ RUN --mount=type=cache,target=/var/cache/cargo --mount=type=cache,target=/app/ta
 
 # smoke test stage: runtime が distroless (shell なし) なのでビルド時自己テストは別ステージで実行する。
 # プラットフォーム指定なし = TARGETPLATFORM、buildx + QEMU 経由で cross-emulation される。
+# original Dockerfile と同じ UID 852 で実行することで本番稼働 UID とテスト UID の整合を保つ。
 FROM public.ecr.aws/docker/library/alpine:latest AS smoke_test
+RUN addgroup -g 852 proxy && adduser -u 852 -G proxy -D -h /test proxy
 WORKDIR /test
-COPY --from=build_app /app/media-proxy-rs ./media-proxy-rs
-COPY --from=build_app /app/healthcheck ./healthcheck
+COPY --from=build_app --chown=852:852 /app/media-proxy-rs ./media-proxy-rs
+COPY --from=build_app --chown=852:852 /app/healthcheck ./healthcheck
+USER 852:852
 RUN sh -c "MEDIA_PROXY_ALLOWED_NETWORKS=127.0.0.0/8 ./media-proxy-rs&" && ./healthcheck 12887 http://127.0.0.1:12766/test.webp && touch /test/passed
 
 # runtime stage 用の rootfs を 852 所有でステージングする (distroless には mkdir/chown が無く、
