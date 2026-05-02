@@ -36,11 +36,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # gcr.io/distroless/static-debian13 がサポートする arch のみ。
+        # 旧マトリクスの linux/386 / linux/arm/v6 は distroless に manifest が無いため非対応。
         platform:
-          - linux/386
           - linux/amd64
           - linux/arm64
-          - linux/arm/v6
           - linux/arm/v7
           - linux/riscv64
     steps:
@@ -151,11 +151,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # gcr.io/distroless/static-debian13 がサポートする arch のみ。
         platform:
-          - linux/386
           - linux/amd64
           - linux/arm64
-          - linux/arm/v6
           - linux/arm/v7
     steps:
       - name: Prepare
@@ -207,11 +206,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # gcr.io/distroless/static-debian13 がサポートする arch のみ。
         platform:
-          - linux/386
           - linux/amd64
           - linux/arm64
-          - linux/arm/v6
           - linux/arm/v7
     steps:
       - name: Prepare
