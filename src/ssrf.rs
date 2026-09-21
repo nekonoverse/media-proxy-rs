@@ -342,6 +342,12 @@ pub(crate) fn is_ip_blocked(config: &ConfigFile, ip: IpAddr) -> bool {
 			if let Some(v4) = v6_to_ipv4(&v6) {
 				return is_ip_blocked(config, IpAddr::V4(v4));
 			}
+			// Deprecated site-local addresses are also private destinations,
+			// but are not covered by `is_unique_local`.
+			let is_site_local = (seg[0] & 0xffc0) == 0xfec0;
+			// RFC 8215 reserves 64:ff9b:1::/48 for local-use NAT64. It cannot
+			// be generically translated to IPv4, so reject it outright.
+			let is_local_nat64 = seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001;
 			// Loopback ::1 / unspecified :: / ULA fc00::/7 have an
 			// `allowed_networks` override, mirroring the IPv4 policy.
 			if v6.is_multicast()
@@ -349,6 +355,8 @@ pub(crate) fn is_ip_blocked(config: &ConfigFile, ip: IpAddr) -> bool {
 				|| v6.is_loopback()
 				|| v6.is_unspecified()
 				|| v6.is_unique_local()
+				|| is_site_local
+				|| is_local_nat64
 			{
 				if let Some(allowed) = config.allowed_networks.as_ref() {
 					if parse_v6_nets(allowed).contains(&v6) {
@@ -560,6 +568,8 @@ mod tests {
 			"2002:a9fe:a9fe::",
 			"2001::1",
 			"::ffff:0:7f00:1",
+			"64:ff9b:1::a9fe:a9fe",
+			"fec0::1",
 		] {
 			assert!(is_ip_blocked(&c, v6(ip)), "{} should be blocked", ip);
 		}

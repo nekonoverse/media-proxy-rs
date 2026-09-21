@@ -12,6 +12,27 @@ pub(crate) fn probe_dimensions(src: &[u8]) -> Option<(u32, u32)> {
 	reader.into_dimensions().ok()
 }
 
+/// TGA has no signature, so `with_guessed_format` cannot identify it. Only
+/// call this after the MIME policy has explicitly selected TGA.
+fn tga_dimensions(src: &[u8]) -> Option<(u32, u32)> {
+	if src.len() < 18 {
+		return None;
+	}
+	let width = u16::from_le_bytes([src[12], src[13]]) as u32;
+	let height = u16::from_le_bytes([src[14], src[15]]) as u32;
+	(width != 0 && height != 0).then_some((width, height))
+}
+
+/// Header-only dimensions for a codec already selected by the request path.
+/// Unlike `probe_dimensions`, this handles the signatureless TGA format.
+fn probe_dimensions_for_format(src: &[u8], format: image::ImageFormat) -> Option<(u32, u32)> {
+	if format == image::ImageFormat::Tga {
+		tga_dimensions(src)
+	} else {
+		probe_dimensions(src)
+	}
+}
+
 /// Shared decode-dimension policy (also used for SVG-embedded rasters, M-01).
 pub(crate) fn dimensions_allowed_for(max_decode_pixels: u64, width: u64, height: u64) -> bool {
 	if width == 0 || height == 0 {
@@ -236,11 +257,16 @@ fn gif_animation_within_budget(data: &[u8], max_decode_pixels: u64) -> Result<()
 }
 
 impl RequestContext {
-	/// Upper bound on decoded pixels so a small file cannot expand into
-	/// gigabytes of RAM (finding #4). Tied to max_size: decoded RGBA must fit
-	/// within the same byte budget as the download itself.
-	pub(crate) fn max_decode_pixels(&self) -> u64 {
+	/// Maximum allocation delegated to an image decoder. A decoded image is
+	/// subsequently resized and converted, so reserve most of `max_size` for
+	/// those temporary copies and the buffered source.
+	pub(crate) fn max_decode_bytes(&self) -> u64 {
 		(self.config.max_size / 4).max(1)
+	}
+	/// Dimension gate expressed using the largest supported source pixel
+	/// representation (RGBA f32 = 16 bytes/pixel), not the final RGBA8 form.
+	pub(crate) fn max_decode_pixels(&self) -> u64 {
+		(self.max_decode_bytes() / 16).max(1)
 	}
 	pub(crate) fn dimensions_allowed(&self, width: u64, height: u64) -> bool {
 		dimensions_allowed_for(self.max_decode_pixels(), width, height)
@@ -310,12 +336,14 @@ impl RequestContext {
 	pub(crate) fn encode_img(&mut self) -> axum::response::Response {
 		// Pre-decode dimension gate for image-crate formats (finding #4).
 		// JXL/JP2/JXR return early below with their own header checks.
-		if self.codec.is_ok() {
-			if let Some((w, h)) = probe_dimensions(&self.src_bytes) {
-				if !self.dimensions_allowed(w as u64, h as u64) {
+		if let Ok(codec) = &self.codec {
+			match probe_dimensions_for_format(&self.src_bytes, *codec) {
+				Some((w, h)) if self.dimensions_allowed(w as u64, h as u64) => {}
+				Some((w, h)) => {
 					return self
 						.decode_limit_response(format!("DecodeDimensions {}x{} over limit", w, h));
 				}
+				None => return self.decode_limit_response("UnprobeableDimensions".to_owned()),
 			}
 		}
 		if self.parms.r#static.is_some() {
@@ -798,8 +826,16 @@ impl RequestContext {
 	}
 	fn encode_single(&mut self) -> axum::response::Response {
 		let img = match &self.codec {
-			Ok(codec) => image::load_from_memory_with_format(&self.src_bytes, *codec)
-				.map_err(|e| format!("{:?}", e)),
+			Ok(codec) => {
+				let mut reader =
+					image::ImageReader::with_format(std::io::Cursor::new(&self.src_bytes), *codec);
+				reader.limits(image::Limits {
+					max_image_width: Some(32768),
+					max_image_height: Some(32768),
+					max_alloc: Some(self.max_decode_bytes()),
+				});
+				reader.decode().map_err(|e| format!("{:?}", e))
+			}
 			Err(Some(e)) => Err(format!("{:?}", e)),
 			_ => {
 				self.headers
@@ -1084,6 +1120,28 @@ fn resize(
 mod tests {
 	use super::*;
 	use crate::{ConfigFile, FilterType, RequestParams};
+
+	#[test]
+	fn tga_dimensions_are_read_without_a_magic_signature() {
+		let mut data = [0u8; 18];
+		data[12..14].copy_from_slice(&16_000u16.to_le_bytes());
+		data[14..16].copy_from_slice(&10_000u16.to_le_bytes());
+		assert_eq!(tga_dimensions(&data), Some((16_000, 10_000)));
+		assert_eq!(
+			probe_dimensions_for_format(&data, image::ImageFormat::Tga),
+			Some((16_000, 10_000))
+		);
+	}
+
+	#[test]
+	fn decode_budget_uses_worst_case_pixel_size() {
+		let ctx = test_request_context(256 * 1024 * 1024);
+		assert_eq!(ctx.max_decode_bytes(), 64 * 1024 * 1024);
+		assert_eq!(ctx.max_decode_pixels(), 4 * 1024 * 1024);
+		assert!(!ctx.dimensions_allowed(8192, 8192));
+		assert!(!ctx.dimensions_allowed(16_000, 10_000));
+		assert!(ctx.dimensions_allowed(2048, 2048));
+	}
 
 	fn png_chunk(ctype: &[u8; 4], data: &[u8]) -> Vec<u8> {
 		let mut v = Vec::new();

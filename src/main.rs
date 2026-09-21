@@ -23,7 +23,10 @@ mod svg;
 /// per-client rate limiting remain deployment decisions (e.g. reverse proxy
 /// or network policy in front of this Misskey/Cherrypick media proxy).
 static FETCH_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
-	std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(32));
+	// A request retains its downloaded bytes while decoding and encoding. Keep
+	// this deliberately small: the byte limits in img.rs bound an individual
+	// decode, while this bounds the amount of such work that can coexist.
+	std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(4));
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConfigFile {
@@ -465,14 +468,25 @@ async fn get_file(
 	if let Ok(url) = q.url.parse() {
 		headers.append("X-Remote-Url", url);
 	}
-	if config.encode_avif {
-		headers.append("Vary", "Accept,Range".parse().unwrap());
-	}
+	// Range changes the representation regardless of AVIF support; Accept does
+	// too when AVIF negotiation is enabled. Do not let an intermediary reuse a
+	// cached full/range or AVIF/WebP response for a different request.
+	headers.append(
+		"Vary",
+		if config.encode_avif {
+			"Accept,Range"
+		} else {
+			"Range"
+		}
+		.parse()
+		.unwrap(),
+	);
 	let time = chrono::Utc::now();
 	if let Err(s) = check_url(&config, &q.url).await {
-		if let Ok(v) = s.parse() {
-			headers.append("X-Proxy-Error", v);
-		}
+		// `check_url` includes DNS and socket diagnostics. They are useful in
+		// server logs but must not become a DNS/network oracle for callers.
+		eprintln!("URL rejected: {:?}: {}", q.url, s);
+		headers.append("X-Proxy-Error", "UrlRejected".parse().unwrap());
 		if q.fallback.is_some() {
 			headers.append("Content-Type", "image/png".parse().unwrap());
 			return Err((axum::http::StatusCode::OK, headers, (*dummy_img).clone()).into_response());
@@ -529,18 +543,15 @@ async fn get_file(
 		let resp = match req.send().await {
 			Ok(resp) => resp,
 			Err(e) => {
+				eprintln!("fetch failed for {:?}: {:?}", current_url, e);
 				if q.fallback.is_some() {
 					headers.append("Content-Type", "image/png".parse().unwrap());
 					return Err(
 						(axum::http::StatusCode::OK, headers, (*dummy_img).clone()).into_response()
 					);
 				}
-				return Err((
-					axum::http::StatusCode::BAD_REQUEST,
-					headers,
-					format!("{:?}", e),
-				)
-					.into_response());
+				headers.append("X-Proxy-Error", "FetchFailed".parse().unwrap());
+				return Err((axum::http::StatusCode::BAD_GATEWAY, headers).into_response());
 			}
 		};
 		if !resp.status().is_redirection() {
@@ -595,9 +606,8 @@ async fn get_file(
 		drop(stream);
 		let next_str = next.to_string();
 		if let Err(s) = check_url(&config, &next_str).await {
-			if let Ok(v) = s.parse() {
-				headers.append("X-Proxy-Error", v);
-			}
+			eprintln!("redirect rejected: {:?}: {}", next_str, s);
+			headers.append("X-Proxy-Error", "RedirectRejected".parse().unwrap());
 			return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
 		}
 		current_url = next_str;
@@ -643,7 +653,9 @@ async fn get_file(
 			}
 		}
 	}
-	headers.append("Cache-Control", "max-age=300".parse().unwrap());
+	// Success paths replace this with their immutable cache policy. Errors and
+	// fallback responses must never poison a shared cache.
+	headers.append("Cache-Control", "no-store".parse().unwrap());
 	// Refuse MIME sniffing so reflected content types cannot be reinterpreted
 	// (finding #7; also mitigates the #9 sniffing concern).
 	headers.append("X-Content-Type-Options", "nosniff".parse().unwrap());
