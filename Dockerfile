@@ -1,7 +1,4 @@
-FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/rust:latest AS cross_build
-ARG BUILDARCH
-ARG TARGETARCH
-ARG TARGETVARIANT
+FROM public.ecr.aws/docker/library/rust:latest AS cross_build
 RUN apt-get update && apt-get install -y clang musl-dev pkg-config nasm mold git meson ninja-build xz-utils
 COPY crossfiles /app/crossfiles
 RUN bash /app/crossfiles/deps.sh

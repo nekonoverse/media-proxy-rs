@@ -1,9 +1,5 @@
 set -eu
-if [ -f "/app/crossfiles/${TARGETARCH}.sh" ]; then
-	source /app/crossfiles/${TARGETARCH}.sh
-else
-	source /app/crossfiles/${TARGETARCH}/${TARGETVARIANT}.sh
-fi
+source /app/crossfiles/amd64.sh
 cp -r /dav1d/lib /musl/${MUSL_NAME}/dav1d/lib
 mkdir ./.cargo/
 echo "[target.${RUST_TARGET}]" >> ./.cargo/config.toml

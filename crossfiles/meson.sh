@@ -1,9 +1,5 @@
 set -eu
-if [ -f "/app/crossfiles/${TARGETARCH}.sh" ]; then
-	source /app/crossfiles/${TARGETARCH}.sh
-else
-	source /app/crossfiles/${TARGETARCH}/${TARGETVARIANT}.sh
-fi
+source /app/crossfiles/amd64.sh
 if [ ! -f "/app/crossfiles/cross.txt" ]; then
 tee /app/crossfiles/cross.txt << EOS
 [binaries]

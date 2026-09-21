@@ -829,11 +829,11 @@ impl RequestContext {
 			Ok(codec) => {
 				let mut reader =
 					image::ImageReader::with_format(std::io::Cursor::new(&self.src_bytes), *codec);
-				reader.limits(image::Limits {
-					max_image_width: Some(32768),
-					max_image_height: Some(32768),
-					max_alloc: Some(self.max_decode_bytes()),
-				});
+				let mut limits = image::Limits::default();
+				limits.max_image_width = Some(32768);
+				limits.max_image_height = Some(32768);
+				limits.max_alloc = Some(self.max_decode_bytes());
+				reader.limits(limits);
 				reader.decode().map_err(|e| format!("{:?}", e))
 			}
 			Err(Some(e)) => Err(format!("{:?}", e)),
