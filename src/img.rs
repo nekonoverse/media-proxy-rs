@@ -1,7 +1,16 @@
 use axum::response::IntoResponse;
 use image::{AnimationDecoder, DynamicImage, GenericImage, GenericImageView};
 
-use crate::RequestContext;
+use crate::{error_header_value, RequestContext};
+
+/// `error_header_value` の、フォールバック静的トークンを指定できる版。
+pub(crate) fn error_header_value_or(
+	msg: impl AsRef<str>,
+	fallback: &'static str,
+) -> reqwest::header::HeaderValue {
+	reqwest::header::HeaderValue::from_bytes(msg.as_ref().as_bytes())
+		.unwrap_or_else(|_| reqwest::header::HeaderValue::from_static(fallback))
+}
 
 /// Header-only dimension probe (no pixel allocation). Returns None for
 /// formats the `image` crate cannot guess (JXL/JP2/JXR have per-path checks).
@@ -171,15 +180,14 @@ fn png_apng_within_budget(data: &[u8], max_decode_pixels: u64) -> Result<(), Str
 	Ok(())
 }
 
-/// GIF事前スキャン(`frames*canvas_pixels`予算、`webp_animation_within_budget`と同じ
-/// 考え方):GIFには事前のフレーム数が無いため、ブロック構造(拡張ブロックと画像
-/// ディスクリプタ)を走査してピクセルデータをデコードせずにフレームを数える。
+/// GIF事前スキャン:画像ディスクリプタの矩形合計をデコーダが実際に確保する
+/// ピクセル数とみなし、論理画面を超える矩形は仕様上不正なので即座に拒否する
+/// (`gif`/`image` クレートは `check_frame_consistency` の既定が false で矩形を検証しない)。
+/// `webp_animation_within_budget` / `png_apng_within_budget` と同じ考え方。
 fn gif_animation_within_budget(data: &[u8], max_decode_pixels: u64) -> Result<(), String> {
 	if data.len() < 13 || !(data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a")) {
 		return Ok(());
 	}
-	let canvas_pixels = (u16::from_le_bytes([data[6], data[7]]) as u64)
-		.saturating_mul(u16::from_le_bytes([data[8], data[9]]) as u64);
 	let packed = data[10];
 	let mut off = 13usize;
 	if packed & 0x80 != 0 {
@@ -190,6 +198,8 @@ fn gif_animation_within_budget(data: &[u8], max_decode_pixels: u64) -> Result<()
 		};
 	}
 	let mut frames = 0u64;
+	// 実際にデコーダが確保する量(image descriptor 矩形面積の総和)。
+	let mut decoded_pixels = 0u64;
 	loop {
 		let Some(&tag) = data.get(off) else {
 			return Ok(());
@@ -219,12 +229,33 @@ fn gif_animation_within_budget(data: &[u8], max_decode_pixels: u64) -> Result<()
 				if frames > ANIMATION_FRAMES_LIMIT {
 					return Err(format!("FramesLimit {}>{}", frames, ANIMATION_FRAMES_LIMIT));
 				}
-				let total = canvas_pixels.saturating_mul(frames);
-				if total > max_decode_pixels {
-					return Err(format!("DecodePixels {}>{}", total, max_decode_pixels));
-				}
 				if off + 10 > data.len() {
 					return Ok(());
+				}
+				// Image Descriptor: tag(1) + Left(2) + Top(2) + Width(2) + Height(2) + Packed(1)。
+				// gif/image クレートは矩形が論理画面内であることを検証しない
+				// (check_frame_consistency の既定は false) ため、ここで明示的に拒否する。
+				let rect_w = u16::from_le_bytes([data[off + 5], data[off + 6]]) as u64;
+				let rect_h = u16::from_le_bytes([data[off + 7], data[off + 8]]) as u64;
+				let (screen_w, screen_h) = (
+					u16::from_le_bytes([data[6], data[7]]) as u64,
+					u16::from_le_bytes([data[8], data[9]]) as u64,
+				);
+				if rect_w > screen_w || rect_h > screen_h {
+					return Err(format!(
+						"FrameRect {}x{} exceeds screen {}x{}",
+						rect_w, rect_h, screen_w, screen_h
+					));
+				}
+				// デコーダは各フレームでこの矩形サイズのバッファを確保し、
+				// encode_anim がフレーム数上限まで蓄積するため、総和で予算判定する
+				// (webp/png の予算と同じ考え方)。
+				decoded_pixels = decoded_pixels.saturating_add(rect_w.saturating_mul(rect_h));
+				if decoded_pixels > max_decode_pixels {
+					return Err(format!(
+						"DecodePixels {}>{}",
+						decoded_pixels, max_decode_pixels
+					));
 				}
 				let local_packed = data[off + 9];
 				off += 10;
@@ -273,15 +304,18 @@ impl RequestContext {
 	}
 	fn decode_limit_response(&mut self, msg: String) -> axum::response::Response {
 		// msg is built from numbers only, so this parse is infallible; never unwrap (finding #3).
-		let value = reqwest::header::HeaderValue::from_bytes(msg.as_bytes())
-			.unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("DecodeLimit"));
-		self.headers.append("X-Proxy-Error", value);
+		self.headers
+			.append("X-Proxy-Error", error_header_value_or(msg, "DecodeLimit"));
 		(axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
 	}
 }
 
 impl RequestContext {
 	pub(crate) fn image_size_hint(&self) -> (u32, u32) {
+		// libwebp のエンコード可能な最大辺 (WEBP_MAX_DIMENSION)。u32::MAX をそのまま
+		// 幅に使うと、横長画像で resize() 後もこれを超え VP8_ENC_ERROR_BAD_DIMENSION
+		// になる (L-06)。
+		const WEBP_MAX_DIMENSION: u32 = 16383;
 		if self.parms.badge.is_some() {
 			return (96, 96);
 		}
@@ -289,13 +323,13 @@ impl RequestContext {
 			return (498, 422);
 		}
 		if self.parms.emoji.is_some() {
-			return (u32::MAX, 128);
+			return (WEBP_MAX_DIMENSION, 128);
 		}
 		if self.parms.preview.is_some() {
 			return (200, 200);
 		}
 		if self.parms.avatar.is_some() {
-			return (u32::MAX, 320);
+			return (WEBP_MAX_DIMENSION, 320);
 		}
 		(self.config.max_pixels, self.config.max_pixels)
 	}
@@ -336,14 +370,24 @@ impl RequestContext {
 	pub(crate) fn encode_img(&mut self) -> axum::response::Response {
 		// Pre-decode dimension gate for image-crate formats (finding #4).
 		// JXL/JP2/JXR return early below with their own header checks.
-		if let Ok(codec) = &self.codec {
-			match probe_dimensions_for_format(&self.src_bytes, *codec) {
-				Some((w, h)) if self.dimensions_allowed(w as u64, h as u64) => {}
-				Some((w, h)) => {
-					return self
-						.decode_limit_response(format!("DecodeDimensions {}x{} over limit", w, h));
+		if let Ok(codec) = self.codec {
+			// `probe_dimensions`(with_guessed_format)はTGA等マジックバイト表に無い
+			// 形式では常にNoneを返し、予算チェックを素通りさせる (G-02)。既に確定した
+			// codecに対して`with_format`で次元を取得すれば、全デコーダが`into_dimensions`
+			// を実装しているためNoneにならない。
+			match image::ImageReader::with_format(std::io::Cursor::new(&self.src_bytes), codec)
+				.into_dimensions()
+			{
+				Ok((w, h)) => {
+					if !self.dimensions_allowed(w as u64, h as u64) {
+						return self.decode_limit_response(format!(
+							"DecodeDimensions {}x{} over limit",
+							w, h
+						));
+					}
 				}
-				None => return self.decode_limit_response("UnprobeableDimensions".to_owned()),
+				// ヘッダ自体が壊れている場合は既存の decode エラー経路に委ねる。
+				Err(_) => {}
 			}
 		}
 		if self.parms.r#static.is_some() {
@@ -393,7 +437,10 @@ impl RequestContext {
 							Err(e) => {
 								self.headers.append(
 									"X-Proxy-Error",
-									format!("Jpeg2000 Error:{:?}", e).parse().unwrap(),
+									error_header_value(
+										format!("Jpeg2000 Error:{:?}", e),
+										"Jpeg2000 Error",
+									),
 								);
 								return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
 									.into_response();
@@ -450,7 +497,10 @@ impl RequestContext {
 							Ok(Err(e)) => {
 								self.headers.append(
 									"X-Proxy-Error",
-									format!("JpegXR decode pixels {:?}", e).parse().unwrap(),
+									error_header_value(
+										format!("JpegXR decode pixels {:?}", e),
+										"JpegXR decode pixels",
+									),
 								);
 								return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
 									.into_response();
@@ -458,17 +508,26 @@ impl RequestContext {
 							Err(e) => {
 								self.headers.append(
 									"X-Proxy-Error",
-									format!("JpegXR decode bytes {:?}", e).parse().unwrap(),
+									error_header_value(
+										format!("JpegXR decode bytes {:?}", e),
+										"JpegXR decode bytes",
+									),
 								);
 								return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
 									.into_response();
 							}
 						}
 					}
+					Some(Ok("image/x-mng")) => {
+						return self.encode_mng();
+					}
+					Some(Ok("image/avif")) => {
+						return self.encode_avif_seq();
+					}
 					_ => {
 						self.headers.append(
 							"X-Proxy-Error",
-							format!("CodecError:{:?}", e).parse().unwrap(),
+							error_header_value(format!("CodecError:{:?}", e), "CodecError"),
 						);
 						return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
 							.into_response();
@@ -490,8 +549,10 @@ impl RequestContext {
 				// デコーダが全フレームを確保する前に、過大なアニメーションを拒否する
 				// (上記のWebP経路と同じ考え方)。
 				if let Err(e) = png_apng_within_budget(&self.src_bytes, self.max_decode_pixels()) {
-					self.headers
-						.append("X-Proxy-Error", format!("ApngAnim {}", e).parse().unwrap());
+					self.headers.append(
+						"X-Proxy-Error",
+						error_header_value_or(format!("ApngAnim {}", e), "ApngAnim"),
+					);
 					return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
 						.into_response();
 				}
@@ -509,8 +570,10 @@ impl RequestContext {
 				if let Err(e) =
 					gif_animation_within_budget(&self.src_bytes, self.max_decode_pixels())
 				{
-					self.headers
-						.append("X-Proxy-Error", format!("GifAnim {}", e).parse().unwrap());
+					self.headers.append(
+						"X-Proxy-Error",
+						error_header_value_or(format!("GifAnim {}", e), "GifAnim"),
+					);
 					return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
 						.into_response();
 				}
@@ -535,8 +598,10 @@ impl RequestContext {
 					if let Err(e) =
 						webp_animation_within_budget(&self.src_bytes, self.max_decode_pixels())
 					{
-						self.headers
-							.append("X-Proxy-Error", format!("WebPAnim {}", e).parse().unwrap());
+						self.headers.append(
+							"X-Proxy-Error",
+							error_header_value_or(format!("WebPAnim {}", e), "WebPAnim"),
+						);
 						return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
 							.into_response();
 					}
@@ -596,6 +661,11 @@ impl RequestContext {
 				} else {
 					self.encode_single()
 				}
+			}
+			#[cfg(feature = "avif-decoder")]
+			image::ImageFormat::Avif => {
+				// avifブランドでもシーケンストラックがあればアニメとして処理
+				self.encode_avif_seq()
 			}
 			_ => self.encode_single(),
 		}
@@ -735,6 +805,81 @@ impl RequestContext {
 		let frames = image::Frames::new(Box::new(collected.into_iter()));
 		self.encode_anim(frames, loop_count)
 	}
+	fn format_error_response(
+		&mut self,
+		msg: String,
+		fallback: &'static str,
+	) -> axum::response::Response {
+		self.headers
+			.append("X-Proxy-Error", error_header_value(msg, fallback));
+		(axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
+	}
+	/// AVIFシーケンスをアニメWebPへ再エンコード
+	/// シーケンス無しはprimary itemの静止画としてデコード
+	#[cfg(feature = "avif-decoder")]
+	fn encode_avif_seq(&mut self) -> axum::response::Response {
+		let first_frame_only = self.parms.r#static.is_some() || self.parms.badge.is_some();
+		let seq = match crate::avif_seq::decode(
+			&self.src_bytes,
+			self.max_decode_pixels(),
+			ANIMATION_FRAMES_LIMIT,
+			first_frame_only,
+		) {
+			Ok(Some(seq)) => seq,
+			Ok(None) => {
+				return match image::load_from_memory_with_format(
+					&self.src_bytes,
+					image::ImageFormat::Avif,
+				) {
+					Ok(img) => self.response_img(img),
+					Err(e) => {
+						self.format_error_response(format!("DecodeError_{:?}", e), "AvifError")
+					}
+				};
+			}
+			Err(e) => return self.format_error_response(format!("AvifSeq {}", e), "AvifError"),
+		};
+		if first_frame_only || seq.frames.len() == 1 {
+			let Some(frame) = seq.frames.into_iter().next() else {
+				return self.format_error_response("NoAvailableFrames".to_owned(), "AvifError");
+			};
+			return self.response_img(DynamicImage::ImageRgba8(frame.image));
+		}
+		let collected: Vec<Result<image::Frame, image::ImageError>> = seq
+			.frames
+			.into_iter()
+			.map(|frame| {
+				let delay = image::Delay::from_saturating_duration(
+					std::time::Duration::from_millis(frame.duration_ms),
+				);
+				Ok(image::Frame::from_parts(frame.image, 0, 0, delay))
+			})
+			.collect();
+		let frames = image::Frames::new(Box::new(collected.into_iter()));
+		self.encode_anim(frames, 0)
+	}
+	/// アニメはAPNG/GIF等と同じくアニメWebPへ再エンコード
+	fn encode_mng(&mut self) -> axum::response::Response {
+		let first_frame_only = self.parms.r#static.is_some() || self.parms.badge.is_some();
+		let anim = match crate::mng::decode(
+			&self.src_bytes,
+			self.max_decode_pixels(),
+			ANIMATION_FRAMES_LIMIT,
+			first_frame_only,
+		) {
+			Ok(anim) => anim,
+			Err(e) => return self.format_error_response(format!("MngAnim {}", e), "MngError"),
+		};
+		if first_frame_only || anim.frames.len() == 1 {
+			if let Some(frame) = anim.frames.into_iter().next() {
+				return self.response_img(DynamicImage::ImageRgba8(frame.into_buffer()));
+			}
+			return self.format_error_response("NoAvailableFrames".to_owned(), "MngError");
+		}
+		let loop_count = anim.loop_count;
+		let frames = image::Frames::new(Box::new(anim.frames.into_iter().map(Ok)));
+		self.encode_anim(frames, loop_count)
+	}
 	fn encode_anim(&self, frames: image::Frames, loop_count: u32) -> axum::response::Response {
 		let conf = webp::WebPConfig::new().unwrap();
 		let mut size: Option<(u32, u32)> = None;
@@ -825,14 +970,18 @@ impl RequestContext {
 		(axum::http::StatusCode::OK, headers, buf.to_vec()).into_response()
 	}
 	fn encode_single(&mut self) -> axum::response::Response {
+		let max_alloc = self.max_decode_pixels().saturating_mul(4); // RGBA 1px=4byte
 		let img = match &self.codec {
 			Ok(codec) => {
 				let mut reader =
 					image::ImageReader::with_format(std::io::Cursor::new(&self.src_bytes), *codec);
+				// TGA (無圧縮/RLE, 4byte/px) は次元ゲートを通っても、デコーダ自身は
+				// image::Limits::default() の max_alloc=512MiB まで確保できてしまう
+				// (G-02)。プロキシの予算 (max_size) をここにも明示的に適用する。
 				let mut limits = image::Limits::default();
 				limits.max_image_width = Some(32768);
 				limits.max_image_height = Some(32768);
-				limits.max_alloc = Some(self.max_decode_bytes());
+				limits.max_alloc = Some(max_alloc);
 				reader.limits(limits);
 				reader.decode().map_err(|e| format!("{:?}", e))
 			}
@@ -848,7 +997,7 @@ impl RequestContext {
 			Err(e) => {
 				self.headers.append(
 					"X-Proxy-Error",
-					format!("DecodeError_{}", e).parse().unwrap(),
+					error_header_value(format!("DecodeError_{}", e), "DecodeError"),
 				);
 				return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response();
 			}
@@ -900,7 +1049,7 @@ impl RequestContext {
 					Err(e) => {
 						self.headers.append(
 							"X-Proxy-Error",
-							format!("EncodeError_{:?}", e).parse().unwrap(),
+							error_header_value(format!("EncodeError_{:?}", e), "EncodeError"),
 						);
 						(axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
 					}
@@ -919,7 +1068,7 @@ impl RequestContext {
 			Err(e) => {
 				self.headers.append(
 					"X-Proxy-Error",
-					format!("EncodeError_{:?}", e).parse().unwrap(),
+					error_header_value(format!("EncodeError_{:?}", e), "EncodeError"),
 				);
 				(axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
 			}
@@ -1028,8 +1177,7 @@ fn jpegxr_img(
 /// `Debug` 出力は外部由来バイトに基づくためヘッダ不正文字を含む場合が
 /// あり、unwrapしてはならない（finding #3）。
 fn jxl_error_value(e: impl std::fmt::Debug) -> reqwest::header::HeaderValue {
-	reqwest::header::HeaderValue::from_bytes(format!("JpegXL Error:{:?}", e).as_bytes())
-		.unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("JpegXLError"))
+	error_header_value_or(format!("JpegXL Error:{:?}", e), "JpegXLError")
 }
 
 /// jxl-oxideの `Render` 1件を8bitサンプルの `DynamicImage` に変換する。
@@ -1277,9 +1425,20 @@ mod tests {
 	}
 	#[test]
 	fn gif_decode_pixels_over_budget_is_err() {
-		let data = build_gif(65000, 65000, &[gif_frame(1, 1)]);
+		// 修正後の予算は「矩形面積の総和」(G-01)。矩形は論理画面内に収まるが
+		// 総和が予算を超えるケースで DecodePixels となる。
+		let data = build_gif(100, 100, &[gif_frame(100, 100)]);
 		let err = gif_animation_within_budget(&data, 1_000).unwrap_err();
 		assert!(err.contains("DecodePixels"), "{}", err);
+	}
+	#[test]
+	fn gif_frame_rect_exceeding_screen_is_err() {
+		// G-01 の実 PoC: 論理画面 1x1 に対して矩形 65535x65535 は画面外。
+		// 旧予算 (canvas*frames = 1*1*1 = 1) はこれを迂回していたため、矩形が
+		// 論理画面を超える場合は FrameRect として事前拒否する。
+		let data = build_gif(1, 1, &[gif_frame(65535, 65535)]);
+		let err = gif_animation_within_budget(&data, 1_000).unwrap_err();
+		assert!(err.contains("FrameRect"), "{}", err);
 	}
 	#[test]
 	fn gif_extension_blocks_are_not_counted_as_frames() {
