@@ -1,5 +1,6 @@
 {
   "bind_addr": "0.0.0.0:12766",
+  "// bind_addr(unix socket)": "unix:///run/media-proxy/proxy.sock",
   "timeout": 10000,
   "user_agent": "https://github.com/yojo-art/media-proxy-rs",
   "max_size": 268435456,
@@ -13,11 +14,5 @@
   "load_system_fonts": true,
   "webp_quality": 75.0,
   "encode_avif": false,
-  "variant_sizes": {
-    "avatar":  { "width": null, "height": 320 },
-    "emoji":   { "width": null, "height": 128 },
-    "preview": { "width": 200,  "height": 200 },
-    "badge":   { "width": 96,   "height": 96  },
-    "static":  { "width": 498,  "height": 422 }
-  }
+  "unix_socket_permissions": "0666"
 }

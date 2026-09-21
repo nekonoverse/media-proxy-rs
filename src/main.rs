@@ -1,146 +1,72 @@
 use core::str;
-use std::{collections::HashSet, io::Write, net::SocketAddr, pin::Pin, str::FromStr, sync::Arc};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::{
+	io::Write,
+	net::SocketAddr,
+	path::{Path, PathBuf},
+	pin::Pin,
+	str::FromStr,
+	sync::Arc,
+};
 
 use axum::{http::HeaderMap, response::IntoResponse, Router};
-use iprange::IpRange;
-use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 
-/// Custom DNS resolver that validates resolved IPs against SSRF rules at connect time.
-/// This eliminates the TOCTOU gap between check_url() and reqwest's actual connection.
-struct SafeResolver {
-	rtc: Arc<RuntimeConfig>,
-}
-impl reqwest::dns::Resolve for SafeResolver {
-	fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-		let rtc = self.rtc.clone();
-		let host = name.as_str().to_owned();
-		Box::pin(async move {
-			use std::net::ToSocketAddrs;
-			let addrs: Vec<SocketAddr> = format!("{}:0", host)
-				.to_socket_addrs()
-				.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
-				.collect();
-			if addrs.is_empty() {
-				return Err(Box::new(std::io::Error::new(
-					std::io::ErrorKind::Other, "no addresses resolved",
-				)) as Box<dyn std::error::Error + Send + Sync>);
-			}
-			for addr in &addrs {
-				match addr {
-					SocketAddr::V4(v4) => {
-						if let Some(ref custom_blocked) = rtc.ipv4_custom_blocked {
-							if custom_blocked.contains(v4.ip()) {
-								return Err(Box::new(std::io::Error::new(
-									std::io::ErrorKind::PermissionDenied, "Blocked address",
-								)) as Box<dyn std::error::Error + Send + Sync>);
-							}
-						}
-						if rtc.ipv4_blocked.contains(v4.ip()) {
-							let allow = rtc.ipv4_allowed.as_ref()
-								.map(|a| a.contains(v4.ip()))
-								.unwrap_or(false);
-							if !allow {
-								return Err(Box::new(std::io::Error::new(
-									std::io::ErrorKind::PermissionDenied, "Blocked address",
-								)) as Box<dyn std::error::Error + Send + Sync>);
-							}
-						}
-					},
-					SocketAddr::V6(v6) => {
-						if is_ipv6_blocked(v6.ip()) {
-							return Err(Box::new(std::io::Error::new(
-								std::io::ErrorKind::PermissionDenied, "Blocked address",
-							)) as Box<dyn std::error::Error + Send + Sync>);
-						}
-					},
-				}
-			}
-			Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
-		})
-	}
-}
-
-mod img;
-mod svg;
 mod browsersafe;
 mod image_test;
+mod img;
+mod ssrf;
+mod svg;
 
-#[derive(Clone,Debug,Serialize,Deserialize)]
-pub struct ConfigFile{
+/// Bounds concurrent fetch+encode work so that per-request memory budgets
+/// (#4/#5) cannot be multiplied without limit (finding #6). Auth and
+/// per-client rate limiting remain deployment decisions (e.g. reverse proxy
+/// or network policy in front of this Misskey/Cherrypick media proxy).
+static FETCH_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
+	std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(32));
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConfigFile {
 	bind_addr: String,
-	timeout:u64,
-	user_agent:String,
-	max_size:u64,
-	proxy:Option<String>,
-	filter_type:FilterType,
-	max_pixels:u32,
-	append_headers:Vec<String>,
-	load_system_fonts:bool,
-	webp_quality:f32,
-	encode_avif:bool,
-	allowed_networks:Option<Vec<String>>,
-	blocked_networks:Option<Vec<String>>,
-	blocked_hosts:Option<Vec<String>>,
-	#[serde(default="default_max_concurrent")]
-	max_concurrent:u32,
-	#[serde(default)]
-	variant_sizes:VariantSizes,
-	#[serde(default)]
-	enable_transform:bool,
+	timeout: u64,
+	user_agent: String,
+	max_size: u64,
+	proxy: Option<String>,
+	filter_type: FilterType,
+	max_pixels: u32,
+	append_headers: Vec<String>,
+	load_system_fonts: bool,
+	webp_quality: f32,
+	encode_avif: bool,
+	allowed_networks: Option<Vec<String>>,
+	blocked_networks: Option<Vec<String>>,
+	blocked_hosts: Option<Vec<String>>,
+	/// Octal permission bits for a `unix://` `bind_addr` socket, e.g. `"0660"`.
+	/// Defaults to `0666` (existing behavior) when unset.
+	unix_socket_permissions: Option<String>,
 }
-fn default_max_concurrent()->u32{ 64 }
-
-#[derive(Clone,Debug,Serialize,Deserialize)]
-pub struct VariantSize{
-	pub width:Option<u32>,
-	pub height:Option<u32>,
-}
-#[derive(Clone,Debug,Default,Serialize,Deserialize)]
-pub struct VariantSizes{
-	pub avatar:Option<VariantSize>,
-	pub emoji:Option<VariantSize>,
-	pub preview:Option<VariantSize>,
-	pub badge:Option<VariantSize>,
-	pub r#static:Option<VariantSize>,
-}
-
-/// Pre-parsed runtime config (parsed once at startup, shared via Arc)
-pub struct RuntimeConfig{
-	config: ConfigFile,
-	ipv4_blocked: IpRange<Ipv4Net>,
-	ipv4_allowed: Option<IpRange<Ipv4Net>>,
-	ipv4_custom_blocked: Option<IpRange<Ipv4Net>>,
-	blocked_hosts: HashSet<String>,
-}
-
 #[derive(Debug, Deserialize)]
-pub struct RequestParams{
+pub struct RequestParams {
 	url: String,
 	//#[serde(rename = "static")]
-	r#static:Option<String>,
-	emoji:Option<String>,
-	avatar:Option<String>,
-	preview:Option<String>,
-	badge:Option<String>,
-	fallback:Option<String>,
-	#[serde(skip_deserializing)]
-	no_resize:Option<String>,
+	r#static: Option<String>,
+	emoji: Option<String>,
+	avatar: Option<String>,
+	preview: Option<String>,
+	badge: Option<String>,
+	fallback: Option<String>,
 }
-#[derive(Clone, Copy,Debug,Serialize,Deserialize)]
-enum FilterType{
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+enum FilterType {
 	Nearest,
 	Triangle,
 	CatmullRom,
 	Gaussian,
 	Lanczos3,
 }
-impl From<FilterType> for image::imageops::FilterType{
-	fn from(val: FilterType) -> Self {
-		match val {
+impl Into<image::imageops::FilterType> for FilterType {
+	fn into(self) -> image::imageops::FilterType {
+		match self {
 			FilterType::Nearest => image::imageops::Nearest,
 			FilterType::Triangle => image::imageops::Triangle,
 			FilterType::CatmullRom => image::imageops::CatmullRom,
@@ -149,9 +75,9 @@ impl From<FilterType> for image::imageops::FilterType{
 		}
 	}
 }
-impl From<FilterType> for fast_image_resize::FilterType{
-	fn from(val: FilterType) -> Self {
-		match val {
+impl Into<fast_image_resize::FilterType> for FilterType {
+	fn into(self) -> fast_image_resize::FilterType {
+		match self {
 			FilterType::Nearest => fast_image_resize::FilterType::Box,
 			FilterType::Triangle => fast_image_resize::FilterType::Bilinear,
 			FilterType::CatmullRom => fast_image_resize::FilterType::CatmullRom,
@@ -161,13 +87,14 @@ impl From<FilterType> for fast_image_resize::FilterType{
 	}
 }
 async fn shutdown_signal() {
+	use futures::{future::FutureExt, pin_mut};
 	use tokio::signal;
-	use futures::{future::FutureExt,pin_mut};
 	let ctrl_c = async {
 		signal::ctrl_c()
 			.await
 			.expect("failed to install Ctrl+C handler");
-	}.fuse();
+	}
+	.fuse();
 
 	#[cfg(unix)]
 	let terminate = async {
@@ -175,76 +102,28 @@ async fn shutdown_signal() {
 			.expect("failed to install signal handler")
 			.recv()
 			.await;
-	}.fuse();
+	}
+	.fuse();
 	#[cfg(not(unix))]
 	let terminate = std::future::pending::<()>().fuse();
 	pin_mut!(ctrl_c, terminate);
-	futures::select!{
+	futures::select! {
 		_ = ctrl_c => {},
 		_ = terminate => {},
 	}
 }
-
-/// Build RuntimeConfig: parse CIDR ranges and normalize blocked hosts at startup
-fn build_runtime_config(config: ConfigFile) -> RuntimeConfig {
-	// Private + loopback + link-local + CGNAT + unspecified
-	let mut ipv4_blocked: IpRange<Ipv4Net> = [
-		"10.0.0.0/8",
-		"172.16.0.0/12",
-		"192.168.0.0/16",
-		"127.0.0.0/8",
-		"169.254.0.0/16",
-		"0.0.0.0/8",
-		"100.64.0.0/10",
-	]
-		.iter()
-		.map(|s| s.parse().expect("invalid built-in CIDR"))
-		.collect();
-
-	// Merge user-configured blocked networks
-	let ipv4_custom_blocked = config.blocked_networks.as_ref().map(|nets| {
-		nets.iter()
-			.filter_map(|s| s.parse::<Ipv4Net>().ok())
-			.collect::<IpRange<Ipv4Net>>()
-	});
-	if let Some(ref custom) = ipv4_custom_blocked {
-		for net in custom.iter() {
-			ipv4_blocked.add(net);
-		}
-	}
-
-	let ipv4_allowed = config.allowed_networks.as_ref().map(|nets| {
-		nets.iter()
-			.filter_map(|s| s.parse::<Ipv4Net>().ok())
-			.collect::<IpRange<Ipv4Net>>()
-	});
-
-	// Normalize blocked hosts to lowercase
-	let blocked_hosts: HashSet<String> = config.blocked_hosts.as_ref()
-		.map(|hosts| hosts.iter().map(|h| h.to_lowercase()).collect())
-		.unwrap_or_default();
-
-	RuntimeConfig {
-		config,
-		ipv4_blocked,
-		ipv4_allowed,
-		ipv4_custom_blocked,
-		blocked_hosts,
-	}
-}
-
 fn main() {
-	let config_path=match std::env::var("MEDIA_PROXY_CONFIG_PATH"){
-		Ok(path)=>{
-			if path.is_empty(){
+	let config_path = match std::env::var("MEDIA_PROXY_CONFIG_PATH") {
+		Ok(path) => {
+			if path.is_empty() {
 				"config.json".to_owned()
-			}else{
+			} else {
 				path
 			}
-		},
-		Err(_)=>"config.json".to_owned()
+		}
+		Err(_) => "config.json".to_owned(),
 	};
-	if !std::path::Path::new(&config_path).exists(){
+	if !std::path::Path::new(&config_path).exists() {
 		let default_config=ConfigFile{
 			bind_addr: "0.0.0.0:12766".to_owned(),
 			timeout:10000,
@@ -256,7 +135,6 @@ fn main() {
 			append_headers:[
 				"Content-Security-Policy:default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'".to_owned(),
 				"Access-Control-Allow-Origin:*".to_owned(),
-				"X-Content-Type-Options:nosniff".to_owned(),
 			].to_vec(),
 			load_system_fonts:true,
 			webp_quality: 75f32,
@@ -264,309 +142,319 @@ fn main() {
 			allowed_networks:None,
 			blocked_networks:None,
 			blocked_hosts:None,
-			max_concurrent:64,
-			variant_sizes:VariantSizes::default(),
-			enable_transform:false,
+			unix_socket_permissions:None,
 		};
-		let default_config=serde_json::to_string_pretty(&default_config).expect("serialize default config");
-		std::fs::File::create(&config_path).expect("create default config.json").write_all(default_config.as_bytes()).expect("write default config");
+		let default_config = serde_json::to_string_pretty(&default_config).unwrap();
+		std::fs::File::create(&config_path)
+			.expect("create default config.json")
+			.write_all(default_config.as_bytes())
+			.unwrap();
 	}
-	let mut config:ConfigFile=serde_json::from_reader(
-		std::fs::File::open(&config_path).expect("open config.json")
-	).expect("parse config.json");
-	if let Ok(networks)=std::env::var("MEDIA_PROXY_ALLOWED_NETWORKS"){
-		let mut allowed_networks=config.allowed_networks.take().unwrap_or_default();
-		for networks in networks.split(","){
+	let mut config: ConfigFile =
+		serde_json::from_reader(std::fs::File::open(&config_path).unwrap()).unwrap();
+	if let Ok(networks) = std::env::var("MEDIA_PROXY_ALLOWED_NETWORKS") {
+		let mut allowed_networks = config.allowed_networks.take().unwrap_or_default();
+		for networks in networks.split(",") {
 			allowed_networks.push(networks.to_owned());
 		}
 		config.allowed_networks.replace(allowed_networks);
 	}
-	if let Ok(networks)=std::env::var("MEDIA_PROXY_BLOCKED_NETWORKS"){
-		let mut blocked_networks=config.blocked_networks.take().unwrap_or_default();
-		for networks in networks.split(","){
+	if let Ok(networks) = std::env::var("MEDIA_PROXY_BLOCKED_NETWORKS") {
+		let mut blocked_networks = config.blocked_networks.take().unwrap_or_default();
+		for networks in networks.split(",") {
 			blocked_networks.push(networks.to_owned());
 		}
 		config.blocked_networks.replace(blocked_networks);
 	}
-	if let Ok(networks)=std::env::var("MEDIA_PROXY_BLOCKED_HOSTS"){
-		let mut blocked_hosts=config.blocked_hosts.take().unwrap_or_default();
-		for networks in networks.split(","){
+	if let Ok(networks) = std::env::var("MEDIA_PROXY_BLOCKED_HOSTS") {
+		let mut blocked_hosts = config.blocked_hosts.take().unwrap_or_default();
+		for networks in networks.split(",") {
 			blocked_hosts.push(networks.to_owned());
 		}
 		config.blocked_hosts.replace(blocked_hosts);
 	}
-	let runtime_config = build_runtime_config(config);
-	let dummy_png=Arc::new(include_bytes!("../asset/dummy.png").to_vec());
-	let runtime_config=Arc::new(runtime_config);
-	let rt=tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("build tokio runtime");
-	let client=reqwest::ClientBuilder::new()
-		.redirect(reqwest::redirect::Policy::none()) // Disable auto-redirect for SSRF protection
-		.dns_resolver(Arc::new(SafeResolver{ rtc: runtime_config.clone() }));
-	let client=match &runtime_config.config.proxy{
-		Some(url)=>client.proxy(reqwest::Proxy::http(url).expect("invalid proxy URL")),
-		None=>client,
+	// A bad CIDR must stop startup with a clear message (M-05), not turn into
+	// a panic on every request.
+	if let Err(e) = crate::ssrf::validate_network_config(&config) {
+		eprintln!("invalid network configuration: {}", e);
+		std::process::exit(1);
+	}
+	// Resolved up front (not inside serve_on_unix_socket) so a bad value is a
+	// startup error, consistent with the network config validation above.
+	let unix_socket_mode: u32 = match &config.unix_socket_permissions {
+		Some(s) => match parse_unix_socket_mode(s) {
+			Ok(mode) => mode,
+			Err(e) => {
+				eprintln!("invalid unix_socket_permissions: {}", e);
+				std::process::exit(1);
+			}
+		},
+		None => 0o666,
 	};
-	let client=client.build().expect("build reqwest client");
-	let mut fontdb=resvg::usvg::fontdb::Database::new();
-	if runtime_config.config.load_system_fonts{
+	let dummy_png = Arc::new(include_bytes!("../asset/dummy.png").to_vec());
+	let config = Arc::new(config);
+	let rt = tokio::runtime::Builder::new_multi_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+	let client = reqwest::ClientBuilder::new();
+	let client = match &config.proxy {
+		Some(url) => {
+			// See ssrf.rs module doc "Caveat": with an egress proxy configured, the
+			// proxy resolves and connects to the target, so ValidatingResolver's
+			// connect-time SSRF re-validation (DNS-rebinding protection) does not
+			// apply to fetch targets in this mode. Only check_url's independent
+			// pre-check protects proxied requests.
+			eprintln!("WARNING: proxy is configured ({}). Connect-time SSRF re-validation (DNS-rebinding protection) does not apply to fetch targets in this mode; ensure the proxy itself enforces an equivalent SSRF policy.",url);
+			// Proxy::all (not Proxy::http): code-review finding -- Proxy::http
+			// only intercepts http:// targets, so https:// targets (the
+			// majority of real media URLs) would otherwise connect directly,
+			// bypassing the proxy and the warning above entirely.
+			let proxy = match reqwest::Proxy::all(url) {
+				Ok(proxy) => proxy,
+				Err(e) => {
+					eprintln!("invalid proxy configuration {:?}: {}", url, e);
+					std::process::exit(1);
+				}
+			};
+			client.proxy(proxy)
+		}
+		None => client,
+	};
+	// Do NOT follow redirects automatically: each redirect target must pass
+	// check_url again (finding #2). Redirects are followed manually in get_file.
+	let client = client.redirect(reqwest::redirect::Policy::none());
+	// Connect-time SSRF enforcement: validate the addresses the connection is
+	// actually opened to, closing the DNS-rebinding TOCTOU between check_url's
+	// lookup and the connect-time lookup (finding #2).
+	let client = client.dns_resolver(std::sync::Arc::new(crate::ssrf::ValidatingResolver::new(
+		config.clone(),
+	)));
+	let client = client.build().unwrap();
+	let mut fontdb = resvg::usvg::fontdb::Database::new();
+	if config.load_system_fonts {
 		fontdb.load_system_fonts();
 	}
-	if std::path::Path::new("asset/font/").exists(){
+	if std::path::Path::new("asset/font/").exists() {
 		fontdb.load_fonts_dir("asset/font/");
 	}
-	fontdb.load_font_source(resvg::usvg::fontdb::Source::Binary(Arc::new(include_bytes!("../asset/font/Aileron-Light.otf"))));
-	let fontdb=Arc::new(fontdb);
-	let bind_addr=runtime_config.config.bind_addr.clone();
-	let semaphore=Arc::new(tokio::sync::Semaphore::new(runtime_config.config.max_concurrent as usize));
-	let arg_tup=(client,runtime_config,dummy_png,fontdb,semaphore);
-	rt.block_on(async{
-		let enable_transform=arg_tup.1.config.enable_transform;
+	fontdb.load_font_source(resvg::usvg::fontdb::Source::Binary(Arc::new(
+		include_bytes!("../asset/font/Aileron-Light.otf"),
+	)));
+	let fontdb = Arc::new(fontdb);
+	let arg_tup = (client, config, dummy_png, fontdb);
+	rt.block_on(async {
+		let bind_addr = arg_tup.1.bind_addr.clone();
 		let app = Router::new();
-		let arg_tup0=arg_tup.clone();
-		let app=app.route("/",axum::routing::get(move|headers,parms|get_file(None,headers,arg_tup0.clone(),parms)));
-		let app=if enable_transform{
-			let arg_tup_transform=arg_tup.clone();
-			app.route("/transform",axum::routing::post(move|headers,multipart|post_transform(headers,arg_tup_transform.clone(),multipart)))
-		}else{
-			app
-		};
-		let app=app.route("/{*path}",axum::routing::get(move|path,headers,parms|get_file(Some(path),headers,arg_tup.clone(),parms)));
-		if enable_transform{
-			println!("POST /transform endpoint enabled");
-		}
-		let bind_addr=&bind_addr;
-		if bind_addr.starts_with("/") || bind_addr.ends_with(".sock") {
-			// Unix domain socket mode
-			let path=std::path::Path::new(bind_addr);
-			if path.exists() {
-				std::fs::remove_file(path).expect("failed to remove existing socket file");
+		// Liveness probe that never touches the fetch path: the SSRF policy
+		// denies loopback by default, so a self-check going through get_file
+		// can never succeed (Docker build-time check and HEALTHCHECK both
+		// target 127.0.0.1).
+		let app = app.route(
+			"/healthz",
+			axum::routing::get(|| async { (axum::http::StatusCode::OK, "ok") }),
+		);
+		let arg_tup0 = arg_tup.clone();
+		let app = app.route(
+			"/",
+			axum::routing::get(move |headers, parms| {
+				get_file(None, headers, arg_tup0.clone(), parms)
+			}),
+		);
+		let app = app.route(
+			"/{*path}",
+			axum::routing::get(move |path, headers, parms| {
+				get_file(Some(path), headers, arg_tup.clone(), parms)
+			}),
+		);
+		// A single bad request must not kill the process (finding #3).
+		// With panic="abort" removed, this layer turns handler panics into 500s.
+		let app = app.layer(tower_http::catch_panic::CatchPanicLayer::new());
+		// NOTE: handlers do not use ConnectInfo, so plain into_make_service()
+		// works for both TCP and UDS listeners.
+		match parse_bind_addr(&bind_addr) {
+			Ok(BindTarget::Tcp(addr)) => {
+				let listener = match tokio::net::TcpListener::bind(addr).await {
+					Ok(listener) => listener,
+					Err(e) => {
+						eprintln!("failed to bind TCP {}: {}", addr, e);
+						std::process::exit(1);
+					}
+				};
+				eprintln!("listening on {}", addr);
+				axum::serve(listener, app.into_make_service())
+					.with_graceful_shutdown(shutdown_signal())
+					.await
+					.unwrap();
 			}
-			let listener=tokio::net::UnixListener::bind(path).expect("failed to bind unix socket");
-			// Allow other users (e.g. app running as uid 101) to connect
-			std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o666)).expect("failed to chmod socket");
-			println!("Listening on unix:{}",bind_addr);
-			axum::serve(listener,app.into_make_service()).with_graceful_shutdown(shutdown_signal()).await.expect("serve failed");
-			// Clean up socket on shutdown
-			let _=std::fs::remove_file(path);
-		} else {
-			// TCP mode
-			let http_addr:SocketAddr=bind_addr.parse().expect("invalid bind_addr");
-			let listener=tokio::net::TcpListener::bind(http_addr).await.expect("failed to bind TCP");
-			println!("Listening on tcp://{}",http_addr);
-			axum::serve(listener,app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown_signal()).await.expect("serve failed");
+			Ok(BindTarget::Unix(path)) => {
+				#[cfg(not(unix))]
+				{
+					let _ = &path;
+					eprintln!("unix domain socket is only supported on unix platforms");
+					std::process::exit(1);
+				}
+				#[cfg(unix)]
+				{
+					serve_on_unix_socket(app, &path, unix_socket_mode).await;
+				}
+			}
+			Err(e) => {
+				eprintln!("{}", e);
+				std::process::exit(1);
+			}
 		}
 	});
 }
 
-/// Check if an IPv6 address should be blocked (loopback, mapped IPv4, ULA, link-local, etc.)
-fn is_ipv6_blocked(ip: &std::net::Ipv6Addr) -> bool {
-	if ip.is_loopback() || ip.is_multicast() || ip.is_unspecified() {
-		return true;
-	}
-	// Link-local fe80::/10
-	if (ip.segments()[0] & 0xffc0) == 0xfe80 {
-		return true;
-	}
-	// Unique local fc00::/7
-	if (ip.segments()[0] & 0xfe00) == 0xfc00 {
-		return true;
-	}
-	// IPv4-mapped ::ffff:x.x.x.x — delegate to IPv4 check
-	if let Some(v4) = ip.to_ipv4_mapped() {
-		// Will be checked by IPv4 logic at call site
-		return v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified();
-	}
-	false
+/// Where to listen, decided by `bind_addr`.
+enum BindTarget {
+	Tcp(SocketAddr),
+	Unix(PathBuf),
 }
 
-fn check_url(rtc:&RuntimeConfig,url:impl AsRef<str>)->Result<(),String>{
-	let u=reqwest::Url::from_str(url.as_ref()).map_err(|e|format!("{:?}",e))?;
-	match u.scheme().to_lowercase().as_str(){
-		"http"|"https"=>{},
-		scheme=>return Err(format!("scheme: {}",scheme))
+/// Canonical form is `unix:///path/to/sock` (or `unix:/path/to/sock`).
+/// For compatibility a bare absolute path such as `/var/run/.../proxy.sock`
+/// is also accepted as UDS, with a deprecation warning telling the operator
+/// to add the `unix://` prefix. Anything else must parse as `SocketAddr`.
+fn parse_bind_addr(s: &str) -> Result<BindTarget, String> {
+	let s = s.trim();
+	if let Some(rest) = s.strip_prefix("unix://") {
+		if rest.is_empty() {
+			return Err(format!("invalid bind_addr {:?}: empty socket path", s));
+		}
+		return Ok(BindTarget::Unix(PathBuf::from(rest)));
 	}
-	let host=u.host_str().ok_or_else(||"no host".to_owned())?;
-	if rtc.blocked_hosts.contains(&host.to_lowercase()){
+	if let Some(rest) = s.strip_prefix("unix:") {
+		if rest.is_empty() {
+			return Err(format!("invalid bind_addr {:?}: empty socket path", s));
+		}
+		return Ok(BindTarget::Unix(PathBuf::from(rest)));
+	}
+	if let Ok(addr) = s.parse::<SocketAddr>() {
+		return Ok(BindTarget::Tcp(addr));
+	}
+	// Compatibility fallback so the earlier bare-path form keeps working.
+	if s.contains('/') || s.ends_with(".sock") {
+		eprintln!(
+			"WARNING: bind_addr {:?} has no scheme; treating it as a unix socket. Use \"unix://{}\" instead.",
+			s, s
+		);
+		return Ok(BindTarget::Unix(PathBuf::from(s)));
+	}
+	Err(format!(
+		"invalid bind_addr {:?}: expected \"IP:port\" or \"unix:///path/to.sock\"",
+		s
+	))
+}
+
+/// Parses `unix_socket_permissions` (e.g. `"0666"`, `"660"`, `"0o600"`) as
+/// octal permission bits. Accepts an optional `0o` prefix.
+fn parse_unix_socket_mode(s: &str) -> Result<u32, String> {
+	let s = s.trim();
+	let digits = s.strip_prefix("0o").unwrap_or(s);
+	if digits.is_empty() || !digits.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+		return Err(format!("{:?}: expected octal permission bits", s));
+	}
+	let mode = u32::from_str_radix(digits, 8).map_err(|e| format!("{:?}: {}", s, e))?;
+	if mode > 0o777 {
+		return Err(format!("{:?}: out of range (expected 0..=0777)", s));
+	}
+	Ok(mode)
+}
+
+/// Bind a UDS listener: create parent dirs, drop a stale socket file left by
+/// an unclean shutdown, then chmod to `mode` (default `0666`, configurable via
+/// `unix_socket_permissions`) so a reverse proxy running as a different user
+/// can connect.
+#[cfg(unix)]
+async fn serve_on_unix_socket(app: Router, path: &Path, mode: u32) {
+	use std::os::unix::fs::PermissionsExt;
+	if let Some(parent) = path.parent() {
+		if !parent.as_os_str().is_empty() {
+			if let Err(e) = tokio::fs::create_dir_all(parent).await {
+				eprintln!(
+					"failed to create socket parent dir {}: {}",
+					parent.display(),
+					e
+				);
+				std::process::exit(1);
+			}
+		}
+	}
+	match tokio::fs::symlink_metadata(path).await {
+		Ok(_) => {
+			if let Err(e) = tokio::fs::remove_file(path).await {
+				eprintln!("failed to remove stale socket {}: {}", path.display(), e);
+				std::process::exit(1);
+			}
+		}
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+		Err(e) => {
+			eprintln!("failed to stat socket path {}: {}", path.display(), e);
+			std::process::exit(1);
+		}
+	}
+	let listener = match tokio::net::UnixListener::bind(path) {
+		Ok(listener) => listener,
+		Err(e) => {
+			eprintln!("failed to bind unix socket {}: {}", path.display(), e);
+			std::process::exit(1);
+		}
+	};
+	if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+		eprintln!(
+			"failed to chmod {:o} socket {}: {}",
+			mode,
+			path.display(),
+			e
+		);
+		std::process::exit(1);
+	}
+	eprintln!("listening on unix://{}", path.display());
+	axum::serve(listener, app.into_make_service())
+		.with_graceful_shutdown(shutdown_signal())
+		.await
+		.unwrap();
+}
+async fn check_url(config: &Arc<ConfigFile>, url: impl AsRef<str>) -> Result<(), String> {
+	let u = reqwest::Url::from_str(url.as_ref()).map_err(|e| format!("{:?}", e))?;
+	match u.scheme().to_lowercase().as_str() {
+		"http" | "https" => {}
+		scheme => return Err(format!("scheme: {}", scheme)),
+	}
+	let host = u.host_str().ok_or_else(|| "no host".to_owned())?;
+	// Fail fast with a clear error. The connect-time ValidatingResolver
+	// re-enforces the same policy on the addresses actually connected to,
+	// closing the DNS-rebinding TOCTOU (finding #2).
+	if crate::ssrf::is_host_blocked(config.blocked_hosts.as_ref(), host) {
 		return Err("Blocked address".to_owned());
 	}
-	use std::net::{SocketAddr, ToSocketAddrs};
-	let ips=format!("{}:{}",host,u.port_or_known_default().unwrap_or(80)).to_socket_addrs().map_err(|e|format!("{:?} {}",e,host))?;
-	for ip in ips{
-		match ip{
-			SocketAddr::V4(v4) => {
-				if let Some(ref custom_blocked)=rtc.ipv4_custom_blocked{
-					if custom_blocked.contains(v4.ip()){
-						return Err("Blocked address".to_owned());
-					}
-				}
-				if rtc.ipv4_blocked.contains(v4.ip()){
-					let allow=if let Some(ref allow_ips)=rtc.ipv4_allowed{
-						allow_ips.contains(v4.ip())
-					}else{
-						false
-					};
-					if !allow{
-						return Err("Blocked address".to_owned());
-					}
-				}
-			},
-			SocketAddr::V6(v6) => {
-				if is_ipv6_blocked(v6.ip()){
-					return Err("Blocked address".to_owned());
-				}
-			},
-		}
-	}
-	Ok(())
+	// Async resolution so a slow attacker-controlled nameserver cannot stall
+	// the async worker thread (finding #10). Shared LRU cache with the
+	// connect-time resolver keeps both DNS views consistent.
+	let ips = crate::ssrf::cached_lookup_host(host)
+		.await
+		.map_err(|e| format!("{:?} {}", e, host))?;
+	crate::ssrf::validate_resolved_ips(config, &ips)
 }
-
-/// Truncate a URL for safe logging (no tokens/secrets in logs)
-fn truncate_url(url: &str, max_len: usize) -> String {
-	if url.len() <= max_len {
-		url.to_owned()
-	} else {
-		format!("{}...", &url[..max_len])
-	}
-}
-
-/// Maximum number of redirects to follow manually
-const MAX_REDIRECTS: usize = 5;
-
-async fn post_transform(
-	client_headers:axum::http::HeaderMap,
-	(_client,rtc,dummy_img,fontdb,semaphore):(reqwest::Client,Arc<RuntimeConfig>,Arc<Vec<u8>>,Arc<resvg::usvg::fontdb::Database>,Arc<tokio::sync::Semaphore>),
-	mut multipart:axum::extract::Multipart,
-)->Result<(axum::http::StatusCode,HeaderMap,axum::body::Body),axum::response::Response>{
-	let _permit = semaphore.try_acquire().map_err(|_| {
-		(axum::http::StatusCode::SERVICE_UNAVAILABLE, HeaderMap::new()).into_response()
-	})?;
-	let max_size=rtc.config.max_size;
-	let mut file_bytes:Option<Vec<u8>>=None;
-	let mut avatar:Option<String>=None;
-	let mut emoji:Option<String>=None;
-	let mut preview:Option<String>=None;
-	let mut r#static:Option<String>=None;
-	let mut badge:Option<String>=None;
-	let mut no_resize:Option<String>=None;
-	while let Ok(Some(field))=multipart.next_field().await{
-		let name=field.name().unwrap_or("").to_owned();
-		match name.as_str(){
-			"file"=>{
-				let bytes=field.bytes().await.map_err(|_|{
-					(axum::http::StatusCode::BAD_REQUEST,HeaderMap::new()).into_response()
-				})?;
-				if bytes.len() as u64>max_size{
-					let mut headers=HeaderMap::new();
-					headers.append("X-Proxy-Error","content-too-large".parse().unwrap());
-					return Err((axum::http::StatusCode::BAD_REQUEST,headers).into_response());
-				}
-				file_bytes=Some(bytes.to_vec());
-			},
-			"avatar"=>avatar=field.text().await.ok(),
-			"emoji"=>emoji=field.text().await.ok(),
-			"preview"=>preview=field.text().await.ok(),
-			"static"=>r#static=field.text().await.ok(),
-			"badge"=>badge=field.text().await.ok(),
-			"no_resize"=>no_resize=field.text().await.ok(),
-			_=>{}
-		}
-	}
-	let src_bytes=match file_bytes{
-		Some(b) if !b.is_empty()=>b,
-		_=>return Err((axum::http::StatusCode::BAD_REQUEST,HeaderMap::new()).into_response()),
-	};
-	println!("{}\ttransform\tsize:{}\tavatar:{:?}\tpreview:{:?}\tbadge:{:?}\temoji:{:?}\tstatic:{:?}",
-		chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-		src_bytes.len(),
-		avatar,
-		preview,
-		badge,
-		emoji,
-		r#static,
-	);
-	let parms=RequestParams{
-		url:String::new(),
-		r#static,
-		emoji,
-		avatar,
-		preview,
-		badge,
-		fallback:None,
-		no_resize,
-	};
-	// Detect format from bytes
-	let is_svg=std::str::from_utf8(&src_bytes).map(|s|s.trim().starts_with("<svg")).unwrap_or(false);
-	let codec=image::guess_format(&src_bytes).map_err(|e|Some(e));
-	// Parse Accept header for AVIF
-	let mut is_accept_avif=false;
-	if rtc.config.encode_avif{
-		if let Some(accept)=client_headers.get("Accept"){
-			if let Ok(accept)=std::str::from_utf8(accept.as_bytes()){
-				for e in accept.split(","){
-					let mime=e.trim().split(';').next().unwrap_or("").trim();
-					if mime=="image/avif"{
-						is_accept_avif=true;
-					}
-				}
-			}
-		}
-	}
-	let mut headers=HeaderMap::new();
-	headers.append("Cache-Control","no-cache".parse().unwrap());
-	for line in rtc.config.append_headers.iter(){
-		if let Some(idx)=line.find(":"){
-			if idx+1>=line.len(){ continue; }
-			if let Ok(k)=axum::http::HeaderName::from_str(&line[0..idx]){
-				if let Ok(v)=line[idx+1..].parse(){
-					headers.append(k,v);
-				}
-			}
-		}
-	}
-	let mut ctx=RequestContext{
-		is_accept_avif,
-		headers,
-		parms,
-		src_bytes,
-		config:Arc::new(rtc.config.clone()),
-		codec,
-		dummy_img,
-		fontdb:fontdb.clone(),
-	};
-	if is_svg{
-		if let Ok(img)=ctx.encode_svg(fontdb){
-			ctx.headers.remove("Cache-Control");
-			return Err(ctx.response_img(img));
-		}else{
-			return Err((axum::http::StatusCode::OK,ctx.headers.clone(),ctx.src_bytes.clone()).into_response());
-		}
-	}
-	// Image encoding in blocking thread
-	let header=ctx.headers.clone();
-	let resp=if let Ok(resp)=tokio::runtime::Handle::current().spawn_blocking(move||{
-		ctx.encode_img()
-	}).await{
-		resp
-	}else{
-		let mut h=header;
-		h.append("X-Proxy-Error","ImageEncodeThread".parse().unwrap());
-		return Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR,h).into_response());
-	};
-	Err(resp)
-}
-
 async fn get_file(
-	_path:Option<axum::extract::Path<String>>,
-	client_headers:axum::http::HeaderMap,
-	(client,rtc,dummy_img,fontdb,semaphore):(reqwest::Client,Arc<RuntimeConfig>,Arc<Vec<u8>>,Arc<resvg::usvg::fontdb::Database>,Arc<tokio::sync::Semaphore>),
-	axum::extract::Query(q):axum::extract::Query<RequestParams>,
-)->Result<(axum::http::StatusCode,HeaderMap,axum::body::Body),axum::response::Response>{
-	let _permit = semaphore.try_acquire().map_err(|_| {
-		(axum::http::StatusCode::SERVICE_UNAVAILABLE, HeaderMap::new()).into_response()
-	})?;
-	println!("{}\t{}\tavatar:{:?}\tpreview:{:?}\tbadge:{:?}\temoji:{:?}\tstatic:{:?}\tfallback:{:?}",
+	_path: Option<axum::extract::Path<String>>,
+	client_headers: axum::http::HeaderMap,
+	(client, config, dummy_img, fontdb): (
+		reqwest::Client,
+		Arc<ConfigFile>,
+		Arc<Vec<u8>>,
+		Arc<resvg::usvg::fontdb::Database>,
+	),
+	axum::extract::Query(q): axum::extract::Query<RequestParams>,
+) -> Result<(axum::http::StatusCode, HeaderMap, axum::body::Body), axum::response::Response> {
+	let mut headers = HeaderMap::new();
+	// q.url uses {:?} so percent-decoded CR/LF cannot forge log lines (finding #8).
+	println!(
+		"{}\t{:?}\tavatar:{:?}\tpreview:{:?}\tbadge:{:?}\temoji:{:?}\tstatic:{:?}\tfallback:{:?}",
 		chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-		truncate_url(&q.url, 200),
+		q.url,
 		q.avatar,
 		q.preview,
 		q.badge,
@@ -574,889 +462,623 @@ async fn get_file(
 		q.r#static,
 		q.fallback,
 	);
-	let mut headers=HeaderMap::new();
-	// Sanitize URL before putting in header (truncate to safe length)
-	if let Ok(url_val) = truncate_url(&q.url, 512).parse() {
-		headers.append("X-Remote-Url", url_val);
+	if let Ok(url) = q.url.parse() {
+		headers.append("X-Remote-Url", url);
 	}
-	if rtc.config.encode_avif{
-		headers.append("Vary","Accept,Range".parse().unwrap());
+	if config.encode_avif {
+		headers.append("Vary", "Accept,Range".parse().unwrap());
 	}
-	let time=chrono::Utc::now();
-	if let Err(_)=check_url(&rtc,&q.url){
-		if q.fallback.is_some(){
-			headers.append("Content-Type","image/png".parse().unwrap());
-			return Err((axum::http::StatusCode::OK,headers,(*dummy_img).clone()).into_response());
+	let time = chrono::Utc::now();
+	if let Err(s) = check_url(&config, &q.url).await {
+		if let Ok(v) = s.parse() {
+			headers.append("X-Proxy-Error", v);
 		}
-		return Err((axum::http::StatusCode::BAD_REQUEST,headers).into_response())
+		if q.fallback.is_some() {
+			headers.append("Content-Type", "image/png".parse().unwrap());
+			return Err((axum::http::StatusCode::OK, headers, (*dummy_img).clone()).into_response());
+		}
+		return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
 	};
 
-	println!("check_url {}ms",(chrono::Utc::now()-time).num_milliseconds());
-
-	// Manual redirect following with SSRF validation on each hop
+	println!(
+		"check_url {}ms",
+		(chrono::Utc::now() - time).num_milliseconds()
+	);
+	// Bound concurrent work (finding #6). The permit is acquired only after
+	// URL validation so DNS resolution cannot occupy every permit (M-03) and
+	// is held through buffered fetch+encode so memory/CPU budgets cannot be
+	// stacked. Streaming browsersafe passthrough below releases it when the
+	// response is handed off (its memory footprint stays small while streaming).
+	// NOTE: acquire() on a never-closed semaphore never fails with Err, so a
+	// timeout is what actually sheds load with 503 instead of queueing forever.
+	let _permit = match tokio::time::timeout(
+		std::time::Duration::from_secs(30),
+		FETCH_SEMAPHORE.acquire(),
+	)
+	.await
+	{
+		Ok(Ok(permit)) => permit,
+		_ => {
+			headers.append("X-Proxy-Error", "Overloaded".parse().unwrap());
+			return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, headers).into_response());
+		}
+	};
+	// DNS-rebinding TOCTOU (finding #2) is closed for direct fetches: reqwest's
+	// ValidatingResolver (ssrf.rs) re-validates the addresses actually connected
+	// to, using the same DNS cache as check_url, so a second (possibly attacker-
+	// controlled) resolution can never bypass the policy. Redirects are also
+	// re-validated hop by hop below regardless.
+	// Residual risk: when `config.proxy` is set, the egress proxy — not this
+	// process — resolves and connects to the target host, so ValidatingResolver
+	// never sees the target's addresses (see ssrf.rs's module doc "Caveat" and
+	// `ValidatingResolver::resolve`'s `proxy_host` branch). Only this check_url
+	// pre-check protects proxied requests, and the classic rebinding TOCTOU
+	// applies again in that configuration.
+	const MAX_REDIRECTS: u8 = 5;
 	let mut current_url = q.url.clone();
-	let mut resp = None;
-	for _ in 0..MAX_REDIRECTS {
+	let mut redirects: u8 = 0;
+	let resp = loop {
 		let req = client.get(&current_url);
-		let req = req.timeout(std::time::Duration::from_millis(rtc.config.timeout));
-		let req = req.header("User-Agent", rtc.config.user_agent.clone());
+		let req = req.timeout(std::time::Duration::from_millis(config.timeout));
+		let req = req.header("User-Agent", config.user_agent.clone());
 		let req = if let Some(range) = client_headers.get("Range") {
 			req.header("Range", range.as_bytes())
 		} else {
 			req
 		};
-		match req.send().await {
-			Ok(r) => {
-				let status = r.status();
-				if status.is_redirection() {
-					if let Some(location) = r.headers().get("location") {
-						let loc_str = String::from_utf8_lossy(location.as_bytes()).to_string();
-						// Resolve relative URLs
-						let resolved = if loc_str.starts_with("http://") || loc_str.starts_with("https://") {
-							loc_str
-						} else {
-							match reqwest::Url::from_str(&current_url) {
-								Ok(base) => match base.join(&loc_str) {
-									Ok(u) => u.to_string(),
-									Err(_) => {
-										return Err((axum::http::StatusCode::BAD_GATEWAY, headers).into_response());
-									}
-								},
-								Err(_) => {
-									return Err((axum::http::StatusCode::BAD_GATEWAY, headers).into_response());
-								}
-							}
-						};
-						// Validate redirect target against SSRF rules
-						if let Err(_) = check_url(&rtc, &resolved) {
-							return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
-						}
-						current_url = resolved;
-						continue;
-					} else {
-						return Err((axum::http::StatusCode::BAD_GATEWAY, headers).into_response());
-					}
+		let resp = match req.send().await {
+			Ok(resp) => resp,
+			Err(e) => {
+				if q.fallback.is_some() {
+					headers.append("Content-Type", "image/png".parse().unwrap());
+					return Err(
+						(axum::http::StatusCode::OK, headers, (*dummy_img).clone()).into_response()
+					);
 				}
-				resp = Some(r);
-				break;
-			},
-			Err(_) => {
-				if q.fallback.is_some(){
-					headers.append("Content-Type","image/png".parse().unwrap());
-					return Err((axum::http::StatusCode::OK,headers,(*dummy_img).clone()).into_response());
-				}
-				return Err((axum::http::StatusCode::BAD_GATEWAY,headers).into_response())
+				return Err((
+					axum::http::StatusCode::BAD_REQUEST,
+					headers,
+					format!("{:?}", e),
+				)
+					.into_response());
 			}
+		};
+		if !resp.status().is_redirection() {
+			break resp;
 		}
-	}
-	let resp = match resp {
-		Some(r) => r,
-		None => {
-			// Too many redirects
+		if redirects >= MAX_REDIRECTS {
+			headers.append("X-Proxy-Error", "TooManyRedirects".parse().unwrap());
 			return Err((axum::http::StatusCode::BAD_GATEWAY, headers).into_response());
 		}
+		let location = resp
+			.headers()
+			.get(axum::http::header::LOCATION)
+			.and_then(|v| v.to_str().ok().map(|s| s.to_owned()));
+		let Some(location) = location else {
+			break resp;
+		};
+		// Resolve relative Location headers against the current URL, then
+		// re-validate every hop with check_url (finding #2).
+		let base = reqwest::Url::from_str(&current_url)
+			.map_err(|e| {
+				(
+					axum::http::StatusCode::BAD_REQUEST,
+					headers.clone(),
+					format!("{:?}", e),
+				)
+					.into_response()
+			})
+			.map_err(axum::response::Response::from)?;
+		let next = base
+			.join(&location)
+			.map_err(|e| {
+				(
+					axum::http::StatusCode::BAD_REQUEST,
+					headers.clone(),
+					format!("{:?}", e),
+				)
+					.into_response()
+			})
+			.map_err(axum::response::Response::from)?;
+		// Drain only a bounded prefix of the redirect body (H-02). Reading
+		// the whole body with `resp.bytes()` let an attacker buffer gigabytes
+		// per hop (no max_size check applies here).
+		const MAX_REDIRECT_DRAIN: usize = 64 * 1024;
+		let mut stream = resp.bytes_stream();
+		let mut drained = 0usize;
+		while let Some(Ok(chunk)) = stream.next().await {
+			drained += chunk.len();
+			if drained >= MAX_REDIRECT_DRAIN {
+				break;
+			}
+		}
+		drop(stream);
+		let next_str = next.to_string();
+		if let Err(s) = check_url(&config, &next_str).await {
+			if let Ok(v) = s.parse() {
+				headers.append("X-Proxy-Error", v);
+			}
+			return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
+		}
+		current_url = next_str;
+		redirects += 1;
 	};
-
-	fn add_remote_header(key:&'static str,headers:&mut HeaderMap,remote_headers:&reqwest::header::HeaderMap){
-		for v in remote_headers.get_all(key){
-			if let Ok(val) = String::from_utf8_lossy(v.as_bytes()).parse() {
-				headers.append(key, val);
+	fn add_remote_header(
+		key: &'static str,
+		headers: &mut HeaderMap,
+		remote_headers: &reqwest::header::HeaderMap,
+	) {
+		for v in remote_headers.get_all(key) {
+			// Never unwrap on attacker-controlled bytes: from_bytes rejects
+			// CTLs/DEL and we must not panic (finding #3). Invalid values are
+			// dropped instead of aborting the whole process.
+			if let Ok(value) = reqwest::header::HeaderValue::from_bytes(v.as_bytes()) {
+				headers.append(key, value);
 			}
 		}
 	}
-	let remote_headers=resp.headers();
-	add_remote_header("Content-Disposition",&mut headers,remote_headers);
-	add_remote_header("Content-Type",&mut headers,remote_headers);
-	let is_img=if let Some(media)=headers.get("Content-Type"){
-		let s=String::from_utf8_lossy(media.as_bytes());
+	let remote_headers = resp.headers();
+	add_remote_header("Content-Disposition", &mut headers, remote_headers);
+	add_remote_header("Content-Type", &mut headers, remote_headers);
+	let is_img = if let Some(media) = headers.get("Content-Type") {
+		let s = String::from_utf8_lossy(media.as_bytes());
 		s.starts_with("image/")
-	}else{
+	} else {
 		false
 	};
-	if !is_img{
-		add_remote_header("Content-Length",&mut headers,remote_headers);
-		add_remote_header("Content-Range",&mut headers,remote_headers);
-		add_remote_header("Accept-Ranges",&mut headers,remote_headers);
+	if !is_img {
+		add_remote_header("Content-Length", &mut headers, remote_headers);
+		add_remote_header("Content-Range", &mut headers, remote_headers);
+		add_remote_header("Accept-Ranges", &mut headers, remote_headers);
 	}
-	// AVIF Accept header parsing: trim whitespace and strip quality params
-	let mut is_accept_avif=false;
-	if !rtc.config.encode_avif{
+	let mut is_accept_avif = false;
+	if !config.encode_avif {
 		//force no avif
-	}else if let Some(accept)=client_headers.get("Accept"){
-		if let Ok(accept)=std::str::from_utf8(accept.as_bytes()){
-			for e in accept.split(","){
-				let mime = e.trim().split(';').next().unwrap_or("").trim();
-				if mime=="image/avif"{
-					is_accept_avif=true;
+	} else if let Some(accept) = client_headers.get("Accept") {
+		if let Ok(accept) = std::str::from_utf8(accept.as_bytes()) {
+			for e in accept.split(",") {
+				if e == "image/avif" {
+					is_accept_avif = true;
 				}
 			}
 		}
 	}
-	headers.append("Cache-Control","max-age=300".parse().unwrap());
-	for line in rtc.config.append_headers.iter(){
-		if let Some(idx)=line.find(":"){
-			if idx+1>=line.len(){
+	headers.append("Cache-Control", "max-age=300".parse().unwrap());
+	// Refuse MIME sniffing so reflected content types cannot be reinterpreted
+	// (finding #7; also mitigates the #9 sniffing concern).
+	headers.append("X-Content-Type-Options", "nosniff".parse().unwrap());
+	for line in config.append_headers.iter() {
+		if let Some(idx) = line.find(":") {
+			if idx + 1 >= line.len() {
 				continue;
 			}
-			if let Ok(k)=axum::http::HeaderName::from_str(&line[0..idx]){
-				if let Ok(v)=line[idx+1..].parse(){
-					headers.append(k,v);
+			if let Ok(k) = axum::http::HeaderName::from_str(&line[0..idx]) {
+				if let Ok(v) = line[idx + 1..].parse() {
+					headers.append(k, v);
 				}
 			}
 		}
 	}
-	RequestContext{
+	RequestContext {
 		is_accept_avif,
 		headers,
-		parms:q,
-		src_bytes:Vec::new(),
-		config:Arc::new(rtc.config.clone()),
-		codec:Err(None),
+		parms: q,
+		src_bytes: Vec::new(),
+		config,
+		codec: Err(None),
 		dummy_img,
 		fontdb,
-	}.encode(resp,is_img).await
+	}
+	.encode(resp, is_img)
+	.await
 }
-struct RequestContext{
-	is_accept_avif:bool,
-	headers:HeaderMap,
-	parms:RequestParams,
-	src_bytes:Vec<u8>,
-	config:Arc<ConfigFile>,
-	codec:Result<image::ImageFormat,Option<image::ImageError>>,
-	dummy_img:Arc<Vec<u8>>,
-	fontdb:Arc<resvg::usvg::fontdb::Database>,
+struct RequestContext {
+	is_accept_avif: bool,
+	headers: HeaderMap,
+	parms: RequestParams,
+	src_bytes: Vec<u8>,
+	config: Arc<ConfigFile>,
+	codec: Result<image::ImageFormat, Option<image::ImageError>>,
+	dummy_img: Arc<Vec<u8>>,
+	fontdb: Arc<resvg::usvg::fontdb::Database>,
 }
-impl RequestContext{
-	pub fn disposition_ext(headers:&mut HeaderMap,ext:&str){
-		let k="Content-Disposition";
-		if let Some(cd)=headers.get(k){
-			let s=std::str::from_utf8(cd.as_bytes());
-			if let Ok(s)=s{
-				let cd=mailparse::parse_content_disposition(s);
-				let cd_utf8=cd.params.get("filename*");
-				let mut name=None;
-				if let Some(cd_utf8)=cd_utf8{
-					let cd_utf8=cd_utf8.to_uppercase();
-					if cd_utf8.starts_with("UTF-8''")&&cd_utf8.len()>7{
-						name=urlencoding::decode(&cd_utf8[7..]).map(|s|s.to_string()).ok();
+impl RequestContext {
+	pub fn disposition_ext(headers: &mut HeaderMap, ext: &str) {
+		let k = "Content-Disposition";
+		if let Some(cd) = headers.get(k) {
+			let s = std::str::from_utf8(cd.as_bytes());
+			if let Ok(s) = s {
+				let cd = mailparse::parse_content_disposition(s);
+				let cd_utf8 = cd.params.get("filename*");
+				let mut name = None;
+				if let Some(cd_utf8) = cd_utf8 {
+					let cd_utf8 = cd_utf8.to_uppercase();
+					if cd_utf8.starts_with("UTF-8''") && cd_utf8.len() > 7 {
+						name = urlencoding::decode(&cd_utf8[7..])
+							.map(|s| s.to_string())
+							.ok();
 					}
 				}
-				if name.is_none(){
-					if let Some(filename)=cd.params.get("filename"){
-						let m_filename=format!("_:{}",filename);
-						let parsed=mailparse::parse_header(&m_filename.as_bytes());
-						if let Ok((parsed,_))=&parsed{
-							name=Some(parsed.get_value());
-						}else if cd.params.get("name").is_none(){
-							name=Some(filename.clone());
+				if name.is_none() {
+					if let Some(filename) = cd.params.get("filename") {
+						let m_filename = format!("_:{}", filename);
+						let parsed = mailparse::parse_header(&m_filename.as_bytes());
+						if let Ok((parsed, _)) = &parsed {
+							name = Some(parsed.get_value());
+						} else if cd.params.get("name").is_none() {
+							name = Some(filename.clone());
 						}
 					}
 				}
-				let name=name.unwrap_or_else(||cd.params.get("name").map(|s|s.clone()).unwrap_or_else(||"null".to_owned()));
-				let mut name_arr:Vec<&str>=name.split('.').collect();
+				let name = name.unwrap_or_else(|| {
+					cd.params
+						.get("name")
+						.map(|s| s.clone())
+						.unwrap_or_else(|| "null".to_owned())
+				});
+				let mut name_arr: Vec<&str> = name.split('.').collect();
 				name_arr.pop();
-				let name=name_arr.join(".")+ext;
-				let name=urlencoding::encode(&name);
-				let content_disposition=format!("inline; filename=\"{}\";filename*=UTF-8''{};",name,name);
+				let name = name_arr.join(".") + ext;
+				let name = urlencoding::encode(&name);
+				let content_disposition =
+					format!("inline; filename=\"{}\";filename*=UTF-8''{};", name, name);
 				headers.remove(k);
-				if let Ok(val) = content_disposition.parse() {
-					headers.append(k, val);
+				// Must not unwrap: a crafted remote filename must never panic (finding #3).
+				if let Ok(v) = content_disposition.parse() {
+					headers.append(k, v);
 				}
 			}
 		}
 	}
 }
-impl RequestContext{
-	async fn encode(mut self,resp: reqwest::Response,mut is_img:bool)->Result<(axum::http::StatusCode,HeaderMap,axum::body::Body),axum::response::Response>{
-		let mut is_svg=false;
-		let mut content_type=None;
-		if let Some(media)=self.headers.get("Content-Type"){
-			let s=String::from_utf8_lossy(media.as_bytes());
-			if s.as_ref()=="image/svg+xml"{
-				is_svg=true;
-			}else{
-				content_type=Some(s);
+impl RequestContext {
+	async fn encode(
+		mut self,
+		resp: reqwest::Response,
+		mut is_img: bool,
+	) -> Result<(axum::http::StatusCode, HeaderMap, axum::body::Body), axum::response::Response> {
+		let mut is_svg = false;
+		let mut content_type = None;
+		if let Some(media) = self.headers.get("Content-Type") {
+			let s = String::from_utf8_lossy(media.as_bytes());
+			if s.as_ref() == "image/svg+xml" {
+				is_svg = true;
+			} else {
+				content_type = Some(s);
 			}
 		}
-		let status=resp.status();
-		let resp=PreDataStream::new(resp).await;
-		if let Some(Ok(head))=resp.head.as_ref(){
+		let status = resp.status();
+		// リモートがエラーを返したら本文をデコードせずエラーを返す
+		if !status.is_success() {
+			return Err(self.remote_error_response(status));
+		}
+		let resp = PreDataStream::new(resp).await;
+		if let Some(Ok(head)) = resp.head.as_ref() {
 			//utf8にパースできて空白文字を削除した後の先頭部分が<svgの場合はsvg
-			if std::str::from_utf8(&head).map(|s|s.trim().starts_with("<svg")).unwrap_or(false){
-				is_svg=true;
-			}else{
-				self.codec=image::guess_format(head).map_err(|e|Some(e));
-				if self.codec.is_err(){
-					if let Some(content_type)=content_type.as_ref(){
-						match content_type.as_ref(){
-							"image/x-targa"|"image/x-tga"=>self.codec=Ok(image::ImageFormat::Tga),
-							_=>{}
+			if std::str::from_utf8(&head)
+				.map(|s| s.trim().starts_with("<svg"))
+				.unwrap_or(false)
+			{
+				is_svg = true;
+			} else {
+				self.codec = image::guess_format(head).map_err(|e| Some(e));
+				if self.codec.is_err() {
+					if let Some(content_type) = content_type.as_ref() {
+						match content_type.as_ref() {
+							"image/x-targa" | "image/x-tga" => {
+								self.codec = Ok(image::ImageFormat::Tga)
+							}
+							_ => {}
 						}
 					}
-					if head.starts_with(&[0xFF,0x0A])||head.starts_with(&[0x00,0x00,0x00,0x0C,0x4A,0x58,0x4C,0x20,0x0D,0x0A,0x87,0x0A]){
-						is_img=true;
+					if head.starts_with(&[0xFF, 0x0A])
+						|| head.starts_with(&[
+							0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58, 0x4C, 0x20, 0x0D, 0x0A, 0x87, 0x0A,
+						]) {
+						is_img = true;
 						self.headers.remove("Content-Type");
-						self.headers.append("Content-Type", "image/jxl".parse().unwrap());
+						self.headers
+							.append("Content-Type", "image/jxl".parse().unwrap());
 					}
-					if head.starts_with(&[0xFF,0x4F,0xFF,0x51])||head.starts_with(&[0x00,0x00,0x00,0x0C,0x6A,0x50,0x20,0x20,0x0D,0x0A,0x87,0x0A]){
-						is_img=true;
+					if head.starts_with(&[0xFF, 0x4F, 0xFF, 0x51])
+						|| head.starts_with(&[
+							0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20, 0x20, 0x0D, 0x0A, 0x87, 0x0A,
+						]) {
+						is_img = true;
 						self.headers.remove("Content-Type");
-						self.headers.append("Content-Type", "image/jp2".parse().unwrap());
+						self.headers
+							.append("Content-Type", "image/jp2".parse().unwrap());
 					}
-					if head.starts_with(&[0x49,0x49,0xBC]){
-						is_img=true;
+					if head.starts_with(&[0x49, 0x49, 0xBC]) {
+						is_img = true;
 						self.headers.remove("Content-Type");
-						self.headers.append("Content-Type", "image/jxr".parse().unwrap());
+						self.headers
+							.append("Content-Type", "image/jxr".parse().unwrap());
 					}
 				}
 			}
 		}
-		if is_svg{
+		if is_svg {
 			self.load_all(resp).await?;
-			if let Ok(img)=self.encode_svg(self.fontdb.clone()){
+			// SVG parsing/rendering is CPU-bound and attacker-controlled:
+			// run it on the blocking pool with a deadline so it cannot
+			// occupy a tokio worker or the semaphore indefinitely (H-01).
+			let src_bytes = std::mem::take(&mut self.src_bytes);
+			let fontdb = self.fontdb.clone();
+			let size_hint = self.image_size_hint();
+			let max_decode_pixels = self.max_decode_pixels();
+			let timeout_ms = self.config.timeout;
+			if let Ok(img) = crate::svg::render_svg_blocking(
+				src_bytes,
+				fontdb,
+				size_hint,
+				max_decode_pixels,
+				timeout_ms,
+			)
+			.await
+			{
 				self.headers.remove("Content-Length");
 				self.headers.remove("Content-Range");
 				self.headers.remove("Accept-Ranges");
 				self.headers.remove("Cache-Control");
-				self.headers.append("Cache-Control","max-age=31536000, immutable".parse().unwrap());
+				self.headers.append(
+					"Cache-Control",
+					"max-age=31536000, immutable".parse().unwrap(),
+				);
 				return Err(self.response_img(img));
-			}else{
-				return Err((axum::http::StatusCode::OK,self.headers.clone(),self.src_bytes.clone()).into_response());
+			} else {
+				// Never reflect the remote SVG bytes inline: serving attacker XML
+				// as image/svg+xml from the proxy origin is a stored-XSS vector
+				// (finding #7). Fail closed, or serve the dummy image when the
+				// caller asked for a fallback.
+				self.headers.remove("Content-Type");
+				self.headers.remove("Content-Length");
+				self.headers.remove("Content-Range");
+				self.headers.remove("Accept-Ranges");
+				if self.parms.fallback.is_some() {
+					self.headers
+						.append("Content-Type", "image/png".parse().unwrap());
+					return Err((
+						axum::http::StatusCode::OK,
+						self.headers.clone(),
+						(*self.dummy_img).clone(),
+					)
+						.into_response());
+				}
+				self.headers
+					.append("X-Proxy-Error", "SvgEncodeError".parse().unwrap());
+				return Err(
+					(axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
+				);
 			}
-		}else if is_img||self.codec.is_ok(){
+		} else if is_img || self.codec.is_ok() {
 			self.headers.remove("Content-Length");
 			self.headers.remove("Content-Range");
 			self.headers.remove("Accept-Ranges");
 			self.load_all(resp).await?;
-			let dummy_img=self.dummy_img.clone();
-			let is_fallback=self.parms.fallback.is_some();
-			let mut header=self.headers.clone();
-			let mut handle=self;
-			let resp=if let Ok(resp)=tokio::runtime::Handle::current().spawn_blocking(move ||{
-				let resp=handle.encode_img();
-				resp
-			}).await{
-				resp
-			}else{
-				header.append("X-Proxy-Error","ImageEncodeThread".parse().unwrap());
-				return Err(if is_fallback{
-					header.remove("Content-Type");
-					header.append("Content-Type","image/png".parse().unwrap());
-					(axum::http::StatusCode::OK,header,(*dummy_img).clone()).into_response()
-				}else{
-					(axum::http::StatusCode::INTERNAL_SERVER_ERROR,header).into_response()
-				});
+			let dummy_img = self.dummy_img.clone();
+			let is_fallback = self.parms.fallback.is_some();
+			let timeout_ms = self.config.timeout;
+			let mut header = self.headers.clone();
+			let mut handle = self;
+			// Raster decode/resize/encode is CPU-bound and attacker-controlled,
+			// same as SVG rendering (H-01): bound it with a deadline so a
+			// pathological image cannot occupy a blocking-pool thread
+			// indefinitely (code-review finding: this path had no timeout at
+			// all, unlike the SVG path). Same caveat as svg.rs's
+			// render_svg_blocking: abort() cannot preempt an already-running
+			// closure, but does stop one still queued on the blocking pool.
+			let task =
+				tokio::runtime::Handle::current().spawn_blocking(move || handle.encode_img());
+			let abort_handle = task.abort_handle();
+			let resp = match tokio::time::timeout(
+				std::time::Duration::from_millis(timeout_ms.max(1)),
+				task,
+			)
+			.await
+			{
+				Ok(Ok(resp)) => resp,
+				Ok(Err(_join_error)) => {
+					header.append(
+						"X-Proxy-Error",
+						format!("ImageEncodeThread").parse().unwrap(),
+					);
+					return Err(if is_fallback {
+						header.remove("Content-Type");
+						header.append("Content-Type", "image/png".parse().unwrap());
+						(axum::http::StatusCode::OK, header, (*dummy_img).clone()).into_response()
+					} else {
+						(axum::http::StatusCode::INTERNAL_SERVER_ERROR, header).into_response()
+					});
+				}
+				Err(_elapsed) => {
+					abort_handle.abort();
+					header.append("X-Proxy-Error", "ImageEncodeTimeout".parse().unwrap());
+					return Err(if is_fallback {
+						header.remove("Content-Type");
+						header.append("Content-Type", "image/png".parse().unwrap());
+						(axum::http::StatusCode::OK, header, (*dummy_img).clone()).into_response()
+					} else {
+						(axum::http::StatusCode::GATEWAY_TIMEOUT, header).into_response()
+					});
+				}
 			};
-			if is_fallback{
-				return Err(if resp.status()==axum::http::StatusCode::OK{
+			if is_fallback {
+				return Err(if resp.status() == axum::http::StatusCode::OK {
 					resp
-				}else{
+				} else {
 					header.remove("Content-Type");
-					header.append("Content-Type","image/png".parse().unwrap());
-					(axum::http::StatusCode::OK,header,(*dummy_img).clone()).into_response()
+					header.append("Content-Type", "image/png".parse().unwrap());
+					(axum::http::StatusCode::OK, header, (*dummy_img).clone()).into_response()
 				});
 			}
 			return Err(resp);
 		}
-		if let Some(media)=self.headers.get("Content-Type"){
-			let s=String::from_utf8_lossy(media.as_bytes());
-			if crate::browsersafe::FILE_TYPE_BROWSERSAFE.contains(&s.as_ref()){
-
-			}else{
-				self.headers.remove("Content-Type");
-				self.headers.append("Content-Type","octet-stream".parse().unwrap());
-				Self::disposition_ext(&mut self.headers,".unknown");
+		// browsersafe(音声/動画)以外はリモートバイトを中継しない: ダミー画像を返す。
+		// Content-Type 不明もここに含める (省略による回避を防ぐ)。
+		let mut is_browsersafe = false;
+		if let Some(media) = self.headers.get("Content-Type") {
+			let s = String::from_utf8_lossy(media.as_bytes());
+			if crate::browsersafe::FILE_TYPE_BROWSERSAFE.contains(&s.as_ref()) {
+				is_browsersafe = true;
 			}
 		}
-		let body=axum::body::Body::from_stream(resp);
-		if status.is_success(){
-			self.headers.remove("Cache-Control");
-			self.headers.append("Cache-Control","max-age=31536000, immutable".parse().unwrap());
-			if status==reqwest::StatusCode::PARTIAL_CONTENT{
-				Ok((axum::http::StatusCode::PARTIAL_CONTENT,self.headers.clone(),body))
-			}else{
-				Ok((axum::http::StatusCode::OK,self.headers.clone(),body))
-			}
-		}else{
-			self.headers.append("X-Proxy-Error",format!("status:{}",status.as_u16()).parse().unwrap());
-			Err(if self.parms.fallback.is_some(){
-				self.headers.remove("Content-Type");
-				self.headers.append("Content-Type","image/png".parse().unwrap());
-				(axum::http::StatusCode::OK,self.headers.clone(),(*self.dummy_img).clone()).into_response()
-			}else{
-				let status=match status{
-					reqwest::StatusCode::BAD_REQUEST=>axum::http::StatusCode::BAD_REQUEST,
-					reqwest::StatusCode::FORBIDDEN=>axum::http::StatusCode::FORBIDDEN,
-					reqwest::StatusCode::NOT_FOUND=>axum::http::StatusCode::NOT_FOUND,
-					reqwest::StatusCode::REQUEST_TIMEOUT=>axum::http::StatusCode::GATEWAY_TIMEOUT,
-					reqwest::StatusCode::GONE=>axum::http::StatusCode::GONE,
-					reqwest::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS=>axum::http::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
-					_=>axum::http::StatusCode::BAD_GATEWAY,
-				};
-				(status,self.headers.clone()).into_response()
-			})
+		if !is_browsersafe {
+			self.headers.remove("Content-Type");
+			self.headers.remove("Content-Length");
+			self.headers.remove("Content-Range");
+			self.headers.remove("Accept-Ranges");
+			self.headers
+				.append("Content-Type", "image/png".parse().unwrap());
+			self.headers
+				.append("X-Proxy-Error", "NonBrowsersafeType".parse().unwrap());
+			return Err((
+				axum::http::StatusCode::OK,
+				self.headers.clone(),
+				(*self.dummy_img).clone(),
+			)
+				.into_response());
+		}
+		let body = axum::body::Body::from_stream(resp);
+		// ここまで来た時点で status.is_success() は保証されている
+		// (encode()冒頭でエラーは remote_error_response に流れる)。
+		self.headers.remove("Cache-Control");
+		self.headers.append(
+			"Cache-Control",
+			"max-age=31536000, immutable".parse().unwrap(),
+		);
+		if status == reqwest::StatusCode::PARTIAL_CONTENT {
+			Ok((
+				axum::http::StatusCode::PARTIAL_CONTENT,
+				self.headers.clone(),
+				body,
+			))
+		} else {
+			Ok((axum::http::StatusCode::OK, self.headers.clone(), body))
 		}
 	}
-	async fn load_all(&mut self,resp: PreDataStream)->Result<(),axum::response::Response>{
-		let len_hint=resp.content_length.unwrap_or(2048.min(self.config.max_size));
-		if len_hint>self.config.max_size{
-			self.headers.append("X-Proxy-Error","content-too-large".parse().unwrap());
-			return Err((axum::http::StatusCode::BAD_GATEWAY,self.headers.clone()).into_response())
+	/// リモートからのエラーはエラーとして返す
+	/// Content-Length/Content-Range を残すと空ボディと矛盾して壊れるから消す
+	fn remote_error_response(mut self, status: reqwest::StatusCode) -> axum::response::Response {
+		self.headers.remove("Content-Length");
+		self.headers.remove("Content-Range");
+		self.headers.remove("Accept-Ranges");
+		self.headers.append(
+			"X-Proxy-Error",
+			format!("status:{}", status.as_u16()).parse().unwrap(),
+		);
+		if self.parms.fallback.is_some() {
+			self.headers.remove("Content-Type");
+			self.headers
+				.append("Content-Type", "image/png".parse().unwrap());
+			(
+				axum::http::StatusCode::OK,
+				self.headers.clone(),
+				(*self.dummy_img).clone(),
+			)
+				.into_response()
+		} else {
+			let status = match status {
+				reqwest::StatusCode::BAD_REQUEST => axum::http::StatusCode::BAD_REQUEST,
+				reqwest::StatusCode::FORBIDDEN => axum::http::StatusCode::FORBIDDEN,
+				reqwest::StatusCode::NOT_FOUND => axum::http::StatusCode::NOT_FOUND,
+				reqwest::StatusCode::REQUEST_TIMEOUT => axum::http::StatusCode::GATEWAY_TIMEOUT,
+				reqwest::StatusCode::GONE => axum::http::StatusCode::GONE,
+				reqwest::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS => {
+					axum::http::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS
+				}
+				_ => axum::http::StatusCode::BAD_GATEWAY,
+			};
+			(status, self.headers.clone()).into_response()
 		}
-		// Cap initial allocation to 4 MB to prevent malicious Content-Length from causing huge alloc
-		let initial_cap = std::cmp::min(len_hint as usize, 4 * 1024 * 1024);
-		let max_size = self.config.max_size;
-		// Aggregate timeout: 3x the per-request timeout to prevent slow-drip attacks
-		let download_timeout = std::time::Duration::from_millis(self.config.timeout * 3);
-		let download_result = tokio::time::timeout(download_timeout, async move {
-			let mut response_bytes=Vec::with_capacity(initial_cap);
-			let mut resp = resp;
-			while let Some(x) = resp.next().await{
-				match x{
-					Ok(b)=>{
-						if response_bytes.len()+b.len()>max_size as usize{
-							return Err("content-too-large");
-						}
-						response_bytes.extend_from_slice(&b);
-					},
-					Err(_)=>{
-						return Err("upstream-read-error");
+	}
+	async fn load_all(&mut self, mut resp: PreDataStream) -> Result<(), axum::response::Response> {
+		let len_hint = resp
+			.content_length
+			.unwrap_or(2048.min(self.config.max_size));
+		if len_hint > self.config.max_size {
+			self.headers.append(
+				"X-Proxy-Error",
+				format!("lengthHint:{}>{}", len_hint, self.config.max_size)
+					.parse()
+					.unwrap(),
+			);
+			return Err((axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response());
+		}
+		// Never trust the remote Content-Length hint for pre-allocation
+		// (finding #5): cap the initial reservation and let the buffer grow
+		// as bytes actually arrive (still bounded by max_size below).
+		const INITIAL_CAP: u64 = 16 * 1024;
+		let mut response_bytes = Vec::with_capacity(len_hint.min(INITIAL_CAP) as usize);
+		while let Some(x) = resp.next().await {
+			match x {
+				Ok(b) => {
+					if response_bytes.len() + b.len() > self.config.max_size as usize {
+						self.headers.append(
+							"X-Proxy-Error",
+							format!(
+								"length:{}>{}",
+								response_bytes.len() + b.len(),
+								self.config.max_size
+							)
+							.parse()
+							.unwrap(),
+						);
+						return Err((axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
+							.into_response());
 					}
+					response_bytes.extend_from_slice(&b);
+				}
+				Err(e) => {
+					self.headers
+						.append("X-Proxy-Error", format!("LoadAll:{:?}", e).parse().unwrap());
+					return Err((
+						axum::http::StatusCode::BAD_GATEWAY,
+						self.headers.clone(),
+						format!("{:?}", e),
+					)
+						.into_response());
 				}
 			}
-			Ok(response_bytes)
-		}).await;
-		match download_result {
-			Ok(Ok(bytes)) => {
-				self.src_bytes = bytes;
-				Ok(())
-			},
-			Ok(Err(e)) => {
-				self.headers.append("X-Proxy-Error", e.parse().unwrap());
-				Err((axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response())
-			},
-			Err(_) => {
-				self.headers.append("X-Proxy-Error", "download-timeout".parse().unwrap());
-				Err((axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response())
-			}
 		}
+		self.src_bytes = response_bytes;
+		Ok(())
 	}
 }
-struct PreDataStream{
-	content_length:Option<u64>,
-	head:Option<Result<axum::body::Bytes, reqwest::Error>>,
-	last:Pin<Box<dyn futures::stream::Stream<Item=Result<axum::body::Bytes, reqwest::Error>>+Send+Sync>>,
+struct PreDataStream {
+	content_length: Option<u64>,
+	head: Option<Result<axum::body::Bytes, reqwest::Error>>,
+	last: Pin<
+		Box<
+			dyn futures::stream::Stream<Item = Result<axum::body::Bytes, reqwest::Error>>
+				+ Send
+				+ Sync,
+		>,
+	>,
 }
-impl  PreDataStream{
+impl PreDataStream {
 	async fn new(value: reqwest::Response) -> Self {
-		let content_length=value.content_length();
-		let mut stream=value.bytes_stream();
-		let head=stream.next().await;
-		Self{
+		let content_length = value.content_length();
+		let mut stream = value.bytes_stream();
+		let head = stream.next().await;
+		Self {
 			content_length,
 			head,
-			last: Box::pin(stream)
+			last: Box::pin(stream),
 		}
 	}
 }
-impl futures::stream::Stream for PreDataStream{
-	type Item=Result<axum::body::Bytes, reqwest::Error>;
+impl futures::stream::Stream for PreDataStream {
+	type Item = Result<axum::body::Bytes, reqwest::Error>;
 
-	fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
-		let mut r=self.as_mut();
-		if let Some(d)=r.head.take(){
+	fn poll_next(
+		mut self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<Option<Self::Item>> {
+		let mut r = self.as_mut();
+		if let Some(d) = r.head.take() {
 			return std::task::Poll::Ready(Some(d));
 		}
 		r.last.as_mut().poll_next(cx)
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	fn test_runtime_config() -> RuntimeConfig {
-		let config = ConfigFile {
-			bind_addr: "0.0.0.0:12766".to_owned(),
-			timeout: 10000,
-			user_agent: "test".to_owned(),
-			max_size: 256 * 1024 * 1024,
-			proxy: None,
-			filter_type: FilterType::Triangle,
-			max_pixels: 2048,
-			append_headers: vec![],
-			load_system_fonts: false,
-			webp_quality: 75.0,
-			encode_avif: false,
-			allowed_networks: None,
-			blocked_networks: None,
-			blocked_hosts: Some(vec!["evil.com".to_owned(), "Evil.Net".to_owned()]),
-			max_concurrent: 64,
-			variant_sizes: VariantSizes::default(),
-			enable_transform: false,
-		};
-		build_runtime_config(config)
-	}
-
-	#[test]
-	fn test_blocks_private_ipv4() {
-		let rtc = test_runtime_config();
-		// These resolve to loopback/private, should be blocked
-		assert!(check_url(&rtc, "http://127.0.0.1/").is_err());
-		assert!(check_url(&rtc, "http://10.0.0.1/").is_err());
-		assert!(check_url(&rtc, "http://172.16.0.1/").is_err());
-		assert!(check_url(&rtc, "http://192.168.1.1/").is_err());
-		assert!(check_url(&rtc, "http://169.254.169.254/").is_err());
-		assert!(check_url(&rtc, "http://0.0.0.0/").is_err());
-	}
-
-	#[test]
-	fn test_blocks_ipv6_loopback() {
-		let rtc = test_runtime_config();
-		assert!(check_url(&rtc, "http://[::1]/").is_err());
-	}
-
-	#[test]
-	fn test_blocks_invalid_scheme() {
-		let rtc = test_runtime_config();
-		assert!(check_url(&rtc, "ftp://example.com/").is_err());
-		assert!(check_url(&rtc, "file:///etc/passwd").is_err());
-	}
-
-	#[test]
-	fn test_blocked_hosts_case_insensitive() {
-		let rtc = test_runtime_config();
-		assert!(rtc.blocked_hosts.contains("evil.com"));
-		assert!(rtc.blocked_hosts.contains("evil.net"));
-		// Original casing should not appear
-		assert!(!rtc.blocked_hosts.contains("Evil.Net"));
-	}
-
-	#[test]
-	fn test_truncate_url() {
-		assert_eq!(truncate_url("short", 10), "short");
-		assert_eq!(truncate_url("a]long-string-here", 5), "a]lon...");
-	}
-
-	#[test]
-	fn test_ipv6_blocked() {
-		use std::net::Ipv6Addr;
-		assert!(is_ipv6_blocked(&Ipv6Addr::LOCALHOST)); // ::1
-		assert!(is_ipv6_blocked(&Ipv6Addr::UNSPECIFIED)); // ::
-		// fe80::1 (link-local)
-		assert!(is_ipv6_blocked(&"fe80::1".parse().unwrap()));
-		// fc00::1 (ULA)
-		assert!(is_ipv6_blocked(&"fc00::1".parse().unwrap()));
-		// ::ffff:127.0.0.1 (mapped)
-		assert!(is_ipv6_blocked(&"::ffff:127.0.0.1".parse().unwrap()));
-	}
-
-	// --- build_runtime_config() tests ---
-
-	fn make_config(
-		allowed: Option<Vec<String>>,
-		blocked: Option<Vec<String>>,
-		blocked_hosts: Option<Vec<String>>,
-	) -> ConfigFile {
-		ConfigFile {
-			bind_addr: "0.0.0.0:12766".to_owned(),
-			timeout: 10000,
-			user_agent: "test".to_owned(),
-			max_size: 256 * 1024 * 1024,
-			proxy: None,
-			filter_type: FilterType::Triangle,
-			max_pixels: 2048,
-			append_headers: vec![],
-			load_system_fonts: false,
-			webp_quality: 75.0,
-			encode_avif: false,
-			allowed_networks: allowed,
-			blocked_networks: blocked,
-			blocked_hosts,
-			max_concurrent: 64,
-			variant_sizes: VariantSizes::default(),
-			enable_transform: false,
-		}
-	}
-
-	#[test]
-	fn test_build_runtime_config_default_blocked_ranges() {
-		let rtc = build_runtime_config(make_config(None, None, None));
-		assert!(rtc.ipv4_blocked.contains(&"10.0.0.1".parse().unwrap()));
-		assert!(rtc.ipv4_blocked.contains(&"172.16.0.1".parse().unwrap()));
-		assert!(rtc.ipv4_blocked.contains(&"192.168.1.1".parse().unwrap()));
-		assert!(rtc.ipv4_blocked.contains(&"127.0.0.1".parse().unwrap()));
-		assert!(rtc.ipv4_blocked.contains(&"169.254.1.1".parse().unwrap()));
-		assert!(rtc.ipv4_blocked.contains(&"0.0.0.1".parse().unwrap()));
-		assert!(rtc.ipv4_blocked.contains(&"100.64.0.1".parse().unwrap()));
-		assert!(!rtc.ipv4_blocked.contains(&"8.8.8.8".parse().unwrap()));
-		assert!(rtc.ipv4_allowed.is_none());
-		assert!(rtc.ipv4_custom_blocked.is_none());
-		assert!(rtc.blocked_hosts.is_empty());
-	}
-
-	#[test]
-	fn test_build_runtime_config_custom_blocked_networks() {
-		let rtc = build_runtime_config(make_config(None, Some(vec!["203.0.113.0/24".to_owned()]), None));
-		assert!(rtc.ipv4_custom_blocked.is_some());
-		assert!(rtc.ipv4_custom_blocked.as_ref().unwrap().contains(&"203.0.113.1".parse().unwrap()));
-		assert!(rtc.ipv4_blocked.contains(&"203.0.113.1".parse().unwrap()));
-		assert!(rtc.ipv4_blocked.contains(&"10.0.0.1".parse().unwrap()));
-		assert!(!rtc.ipv4_blocked.contains(&"203.0.114.1".parse().unwrap()));
-	}
-
-	#[test]
-	fn test_build_runtime_config_allowed_networks() {
-		let rtc = build_runtime_config(make_config(Some(vec!["10.5.0.0/16".to_owned()]), None, None));
-		assert!(rtc.ipv4_allowed.is_some());
-		assert!(rtc.ipv4_allowed.as_ref().unwrap().contains(&"10.5.0.1".parse().unwrap()));
-		assert!(!rtc.ipv4_allowed.as_ref().unwrap().contains(&"10.6.0.1".parse().unwrap()));
-	}
-
-	#[test]
-	fn test_build_runtime_config_blocked_hosts_normalization() {
-		let rtc = build_runtime_config(make_config(None, None, Some(vec![
-			"EVIL.COM".to_owned(), "Mixed.Case.Net".to_owned(), "already-lower.org".to_owned(),
-		])));
-		assert!(rtc.blocked_hosts.contains("evil.com"));
-		assert!(rtc.blocked_hosts.contains("mixed.case.net"));
-		assert!(rtc.blocked_hosts.contains("already-lower.org"));
-		assert!(!rtc.blocked_hosts.contains("EVIL.COM"));
-	}
-
-	#[test]
-	fn test_build_runtime_config_invalid_cidr_ignored() {
-		let rtc = build_runtime_config(make_config(None, Some(vec![
-			"not-a-cidr".to_owned(), "300.0.0.0/8".to_owned(), "10.0.0.0/8".to_owned(),
-		]), None));
-		assert!(rtc.ipv4_custom_blocked.is_some());
-		assert!(rtc.ipv4_custom_blocked.as_ref().unwrap().contains(&"10.0.0.1".parse().unwrap()));
-	}
-
-	#[test]
-	fn test_build_runtime_config_empty_options() {
-		let rtc = build_runtime_config(make_config(Some(vec![]), Some(vec![]), Some(vec![])));
-		assert!(rtc.ipv4_allowed.is_some());
-		assert!(rtc.ipv4_custom_blocked.is_some());
-		assert!(rtc.blocked_hosts.is_empty());
-	}
-
-	// --- check_url() additional tests ---
-
-	#[test]
-	fn test_check_url_allows_public_ipv4() {
-		let rtc = test_runtime_config();
-		assert!(check_url(&rtc, "http://8.8.8.8/").is_ok());
-		assert!(check_url(&rtc, "https://1.1.1.1/").is_ok());
-	}
-
-	#[test]
-	fn test_check_url_allowed_networks_override() {
-		let rtc = build_runtime_config(make_config(
-			Some(vec!["10.5.0.0/16".to_owned()]), None, None,
-		));
-		assert!(check_url(&rtc, "http://10.5.0.1/").is_ok());
-		assert!(check_url(&rtc, "http://10.6.0.1/").is_err());
-	}
-
-	#[test]
-	fn test_check_url_custom_blocked_networks() {
-		let rtc = build_runtime_config(make_config(
-			None, Some(vec!["203.0.113.0/24".to_owned()]), None,
-		));
-		assert!(check_url(&rtc, "http://203.0.113.50/").is_err());
-		assert!(check_url(&rtc, "http://203.0.114.1/").is_ok());
-	}
-
-	#[test]
-	fn test_check_url_invalid_url() {
-		let rtc = test_runtime_config();
-		assert!(check_url(&rtc, "not a url").is_err());
-		assert!(check_url(&rtc, "").is_err());
-	}
-
-	#[test]
-	fn test_check_url_data_scheme_blocked() {
-		let rtc = test_runtime_config();
-		assert!(check_url(&rtc, "data:text/html,<h1>XSS</h1>").is_err());
-		assert!(check_url(&rtc, "javascript:alert(1)").is_err());
-	}
-
-	#[test]
-	fn test_check_url_cgnat_blocked() {
-		let rtc = test_runtime_config();
-		assert!(check_url(&rtc, "http://100.64.0.1/").is_err());
-		assert!(check_url(&rtc, "http://100.127.255.254/").is_err());
-	}
-
-	// --- truncate_url() additional tests ---
-
-	#[test]
-	fn test_truncate_url_exact_boundary() {
-		assert_eq!(truncate_url("12345", 5), "12345");
-	}
-
-	#[test]
-	fn test_truncate_url_empty() {
-		assert_eq!(truncate_url("", 5), "");
-	}
-
-	#[test]
-	fn test_truncate_url_zero_max() {
-		assert_eq!(truncate_url("abc", 0), "...");
-	}
-
-	// --- is_ipv6_blocked() additional tests ---
-
-	#[test]
-	fn test_ipv6_not_blocked_public() {
-		assert!(!is_ipv6_blocked(&"2606:4700::1".parse().unwrap()));
-		assert!(!is_ipv6_blocked(&"2001:4860:4860::8888".parse().unwrap()));
-	}
-
-	#[test]
-	fn test_ipv6_multicast_blocked() {
-		assert!(is_ipv6_blocked(&"ff02::1".parse().unwrap()));
-	}
-
-	#[test]
-	fn test_ipv6_mapped_ipv4_public() {
-		assert!(!is_ipv6_blocked(&"::ffff:8.8.8.8".parse().unwrap()));
-	}
-
-	// --- disposition_ext() tests ---
-
-	#[test]
-	fn test_disposition_ext_simple_filename() {
-		let mut headers = HeaderMap::new();
-		headers.insert("Content-Disposition", "inline; filename=\"photo.jpg\"".parse().unwrap());
-		RequestContext::disposition_ext(&mut headers, ".webp");
-		let val = headers.get("Content-Disposition").unwrap().to_str().unwrap();
-		assert!(val.contains("photo.webp"), "expected photo.webp in: {}", val);
-	}
-
-	#[test]
-	fn test_disposition_ext_multiple_dots() {
-		let mut headers = HeaderMap::new();
-		headers.insert("Content-Disposition", "inline; filename=\"archive.tar.gz\"".parse().unwrap());
-		RequestContext::disposition_ext(&mut headers, ".webp");
-		let val = headers.get("Content-Disposition").unwrap().to_str().unwrap();
-		assert!(val.contains("archive.tar.webp"), "expected archive.tar.webp in: {}", val);
-	}
-
-	#[test]
-	fn test_disposition_ext_utf8_filename_star() {
-		let mut headers = HeaderMap::new();
-		headers.insert("Content-Disposition", "inline; filename*=UTF-8''%E7%94%BB%E5%83%8F.png".parse().unwrap());
-		RequestContext::disposition_ext(&mut headers, ".webp");
-		let val = headers.get("Content-Disposition").unwrap().to_str().unwrap();
-		assert!(val.contains(".webp"), "expected .webp in: {}", val);
-		assert!(!val.contains(".png"), "should not contain .png in: {}", val);
-	}
-
-	#[test]
-	fn test_disposition_ext_name_fallback() {
-		let mut headers = HeaderMap::new();
-		headers.insert("Content-Disposition", "inline; name=\"fallback.jpg\"".parse().unwrap());
-		RequestContext::disposition_ext(&mut headers, ".webp");
-		let val = headers.get("Content-Disposition").unwrap().to_str().unwrap();
-		assert!(val.contains("fallback.webp"), "expected fallback.webp in: {}", val);
-	}
-
-	#[test]
-	fn test_disposition_ext_no_header() {
-		let mut headers = HeaderMap::new();
-		RequestContext::disposition_ext(&mut headers, ".webp");
-		assert!(headers.get("Content-Disposition").is_none());
-	}
-
-	#[test]
-	fn test_disposition_ext_no_filename() {
-		let mut headers = HeaderMap::new();
-		headers.insert("Content-Disposition", "attachment".parse().unwrap());
-		RequestContext::disposition_ext(&mut headers, ".webp");
-		let val = headers.get("Content-Disposition").unwrap().to_str().unwrap();
-		assert!(val.contains(".webp"), "expected .webp in: {}", val);
-	}
-
-	// --- ConfigFile serde tests ---
-
-	#[test]
-	fn test_config_default_max_concurrent() {
-		let json = r#"{
-			"bind_addr": "0.0.0.0:12766",
-			"timeout": 10000,
-			"user_agent": "test",
-			"max_size": 268435456,
-			"proxy": null,
-			"filter_type": "Triangle",
-			"max_pixels": 2048,
-			"append_headers": [],
-			"load_system_fonts": false,
-			"webp_quality": 75.0,
-			"encode_avif": false,
-			"allowed_networks": null,
-			"blocked_networks": null,
-			"blocked_hosts": null
-		}"#;
-		let config: ConfigFile = serde_json::from_str(json).unwrap();
-		assert_eq!(config.max_concurrent, 64);
-	}
-
-	#[test]
-	fn test_config_roundtrip() {
-		let config = make_config(None, None, None);
-		let json = serde_json::to_string(&config).unwrap();
-		let config2: ConfigFile = serde_json::from_str(&json).unwrap();
-		assert_eq!(config2.bind_addr, config.bind_addr);
-		assert_eq!(config2.timeout, config.timeout);
-		assert_eq!(config2.max_pixels, config.max_pixels);
-		assert_eq!(config2.max_concurrent, config.max_concurrent);
-	}
-
-	// --- enable_transform tests ---
-
-	#[test]
-	fn test_config_enable_transform_defaults_to_false() {
-		// enable_transform を省略した場合、デフォルトで false になること
-		let json = r#"{
-			"bind_addr": "0.0.0.0:12766",
-			"timeout": 10000,
-			"user_agent": "test",
-			"max_size": 268435456,
-			"proxy": null,
-			"filter_type": "Triangle",
-			"max_pixels": 2048,
-			"append_headers": [],
-			"load_system_fonts": false,
-			"webp_quality": 75.0,
-			"encode_avif": false
-		}"#;
-		let config: ConfigFile = serde_json::from_str(json).unwrap();
-		assert!(!config.enable_transform);
-	}
-
-	#[test]
-	fn test_config_enable_transform_explicit_true() {
-		let json = r#"{
-			"bind_addr": "0.0.0.0:12766",
-			"timeout": 10000,
-			"user_agent": "test",
-			"max_size": 268435456,
-			"proxy": null,
-			"filter_type": "Triangle",
-			"max_pixels": 2048,
-			"append_headers": [],
-			"load_system_fonts": false,
-			"webp_quality": 75.0,
-			"encode_avif": false,
-			"enable_transform": true
-		}"#;
-		let config: ConfigFile = serde_json::from_str(json).unwrap();
-		assert!(config.enable_transform);
-	}
-
-	#[test]
-	fn test_no_resize_not_deserialized_from_query() {
-		// skip_deserializing により、クエリパラメータから no_resize が設定されないこと
-		let json = r#"{
-			"url": "http://example.com/img.jpg",
-			"no_resize": "1"
-		}"#;
-		let parms: RequestParams = serde_json::from_str(json).unwrap();
-		assert!(parms.no_resize.is_none());
-	}
-
-	#[test]
-	fn test_no_resize_can_be_set_directly() {
-		// struct 直接構築では no_resize を設定できること (post_transform の動作)
-		let parms = RequestParams {
-			url: String::new(),
-			r#static: None,
-			emoji: None,
-			avatar: None,
-			preview: None,
-			badge: None,
-			fallback: None,
-			no_resize: Some("1".to_owned()),
-		};
-		assert!(parms.no_resize.is_some());
-	}
-
-	// --- FilterType conversion tests ---
-
-	#[test]
-	fn test_filter_type_conversions() {
-		let _: image::imageops::FilterType = FilterType::Nearest.into();
-		let _: image::imageops::FilterType = FilterType::Triangle.into();
-		let _: image::imageops::FilterType = FilterType::CatmullRom.into();
-		let _: image::imageops::FilterType = FilterType::Gaussian.into();
-		let _: image::imageops::FilterType = FilterType::Lanczos3.into();
-		let _: fast_image_resize::FilterType = FilterType::Nearest.into();
-		let _: fast_image_resize::FilterType = FilterType::Triangle.into();
-		let _: fast_image_resize::FilterType = FilterType::CatmullRom.into();
-		let _: fast_image_resize::FilterType = FilterType::Gaussian.into();
-		let _: fast_image_resize::FilterType = FilterType::Lanczos3.into();
-	}
-
-	// --- UDS detection tests ---
-
-	#[test]
-	fn test_bind_addr_uds_detection() {
-		let uds_paths = ["/run/media-proxy.sock", "/tmp/proxy.sock", "/var/run/app.socket"];
-		for path in &uds_paths {
-			assert!(
-				path.starts_with("/") || path.ends_with(".sock"),
-				"{} should be detected as UDS", path
-			);
-		}
-		assert!("proxy.sock".ends_with(".sock"));
-	}
-
-	#[test]
-	fn test_bind_addr_tcp_detection() {
-		let tcp_addrs = ["0.0.0.0:12766", "127.0.0.1:8080", "[::]:12766"];
-		for addr in &tcp_addrs {
-			assert!(
-				!addr.starts_with("/") && !addr.ends_with(".sock"),
-				"{} should be detected as TCP", addr
-			);
-		}
-	}
-
-	// --- UDS integration test ---
-
-	#[tokio::test]
-	async fn test_uds_bind_and_request() {
-		use tokio::net::UnixListener;
-		use tokio::io::{AsyncWriteExt, AsyncReadExt};
-
-		let dir = std::env::temp_dir();
-		let sock_path = dir.join(format!("media-proxy-test-{}.sock", std::process::id()));
-		let _ = std::fs::remove_file(&sock_path);
-
-		let listener = UnixListener::bind(&sock_path).expect("bind UDS");
-
-		let app = Router::new().route("/health", axum::routing::get(|| async { "ok" }));
-		let sock_path_clone = sock_path.clone();
-		let handle = tokio::spawn(async move {
-			axum::serve(listener, app.into_make_service()).await.unwrap();
-		});
-
-		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-		let stream = tokio::net::UnixStream::connect(&sock_path).await.expect("connect UDS");
-		let (mut reader, mut writer) = tokio::io::split(stream);
-		writer.write_all(b"GET /health HTTP/1.0\r\n\r\n").await.unwrap();
-		writer.shutdown().await.unwrap();
-
-		let mut buf = vec![0u8; 4096];
-		let n = reader.read(&mut buf).await.unwrap();
-		let response = String::from_utf8_lossy(&buf[..n]);
-		assert!(response.contains("200"), "expected 200 in response: {}", response);
-		assert!(response.contains("ok"), "expected 'ok' in response: {}", response);
-
-		handle.abort();
-		let _ = std::fs::remove_file(&sock_path);
 	}
 }
