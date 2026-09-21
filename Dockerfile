@@ -29,6 +29,7 @@ ENV PKG_CONFIG_PATH=/dav1d/lib/pkgconfig
 ENV LD_LIBRARY_PATH=/dav1d/lib
 COPY src ./src
 COPY Cargo.toml ./Cargo.toml
+COPY Cargo.lock ./Cargo.lock
 COPY asset ./asset
 COPY examples ./examples
 RUN --mount=type=cache,target=/var/cache/cargo --mount=type=cache,target=/app/target bash /app/crossfiles/build.sh
@@ -55,6 +56,10 @@ COPY --from=build_app --chown=65532:65532 /app/healthcheck /rootfs/media-proxy-r
 
 FROM gcr.io/distroless/static-debian13:nonroot
 COPY --from=runtime_home /rootfs/ /
+# Keep the distribution license and all third-party notices in the final,
+# otherwise shell-less distroless images would ship only the linked binary.
+COPY --chown=65532:65532 LICENSE /media-proxy-rs/LICENSE
+COPY --chown=65532:65532 THIRD-PARTY-NOTICES.md /media-proxy-rs/THIRD-PARTY-NOTICES.md
 COPY --from=smoke_test /test/passed /etc/smoke-passed
 WORKDIR /media-proxy-rs
 USER nonroot:nonroot

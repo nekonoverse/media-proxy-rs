@@ -1,0 +1,24 @@
+# Third-party notices
+
+This file is generated from `Cargo.lock` by `scripts/generate-third-party-notices.sh`.
+Do not edit the generated Cargo dependency section by hand.
+
+## Cargo dependencies
+
+| Package | Version | SPDX license expression |
+| --- | --- | --- |
+{{#each crates}}
+| [{{package.name}}]({{#if package.repository}}{{package.repository}}{{else}}https://crates.io/crates/{{package.name}}{{/if}}) | {{package.version}} | {{license}} |
+{{/each}}
+
+## Cargo dependency license texts
+{{#each overview}}
+
+### {{name}}
+
+Used by: {{#each used_by}}{{crate.name}} {{crate.version}}{{#unless @last}}, {{/unless}}{{/each}}
+
+```text
+{{text}}
+```
+{{/each}}

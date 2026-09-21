@@ -2,6 +2,7 @@
 name="avif-decoder_dep"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 
 [dependencies]
 image = { version = "0.25" , features = ["avif-native"] }

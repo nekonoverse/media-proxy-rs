@@ -72,6 +72,13 @@ media-proxy-rs_linux-riscv64.gz
 
 > Docker イメージは `gcr.io/distroless/static-debian13` ベースに移行したため、shell や `docker exec sh` が使えません。トラブル時はファイルシステム確認に `docker create <image> && docker export <cid> | tar -tvf -` などを利用してください。
 
+## ライセンス通知
+
+本ソフトウェアは Apache-2.0 です。依存コンポーネントの著作権表示・ライセンス全文と、
+`mp4parse` (MPL-2.0) のソース入手先は
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) に記載しています。Docker イメージでは
+`/media-proxy-rs/LICENSE` と `/media-proxy-rs/THIRD-PARTY-NOTICES.md` に同梱されます。
+
 ## 設定ファイル
 環境変数`MEDIA_PROXY_CONFIG_PATH`を設定する事でファイルの場所を指定できます  
 デフォルト値は`$(pwd)/config.json`です  
