@@ -479,6 +479,7 @@ mod tests {
 			user_agent: "test".to_owned(),
 			max_size: 1024,
 			proxy: None,
+			unsafe_allow_proxy: false,
 			filter_type: FilterType::Triangle,
 			max_pixels: 64,
 			append_headers: vec![],

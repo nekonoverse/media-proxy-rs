@@ -13,12 +13,14 @@ fn image_href_resolver(max_decode_pixels: u64) -> usvg::ImageHrefResolver<'stati
 	let resolve_data = usvg::ImageHrefResolver::default_data_resolver();
 	usvg::ImageHrefResolver {
 		resolve_data: Box::new(move |mime, data, opts| {
-			// Only the declared dimensions are read here; unprobeable
-			// payloads fall through and are rejected by resvg if invalid.
-			if let Some((w, h)) = crate::img::probe_dimensions(&data[..]) {
-				if !crate::img::dimensions_allowed_for(max_decode_pixels, w as u64, h as u64) {
-					return None;
-				}
+			// The SVG renderer can decode embedded rasters on its own. Require
+			// dimensions before handing it any data, otherwise signatureless or
+			// unsupported codecs bypass the allocation gate.
+			let Some((w, h)) = crate::img::probe_dimensions(&data[..]) else {
+				return None;
+			};
+			if !crate::img::dimensions_allowed_for(max_decode_pixels, w as u64, h as u64) {
+				return None;
 			}
 			resolve_data(mime, data, opts)
 		}),
@@ -90,8 +92,8 @@ pub(crate) fn render_svg(
 	}
 }
 /// Runs [`render_svg`] on the blocking pool with a deadline (H-01). On
-/// timeout the caller stops waiting and releases its semaphore permit; file
-/// hrefs are disabled, so the remaining work is bounded by the SVG itself.
+/// timeout the caller stops waiting; file hrefs are disabled, so the remaining
+/// work is bounded by the SVG itself.
 ///
 /// Caveat (code-review finding): `tokio::time::timeout` only stops the
 /// *caller* from awaiting -- a blocking-pool closure that has already started
@@ -100,8 +102,9 @@ pub(crate) fn render_svg(
 /// finishes. `abort()` is called anyway because it is not a no-op: for a
 /// render that is still *queued* (not yet picked up by a worker thread, e.g.
 /// because the blocking pool is under pressure from many concurrent slow
-/// renders), it prevents that queued closure from ever starting at all,
-/// which is exactly the pile-up scenario a deadline is meant to cap.
+/// renders), it prevents that queued closure from ever starting at all. The
+/// separate decode permit remains owned by a started closure until it exits,
+/// so timed-out work cannot accumulate beyond that cap.
 pub(crate) async fn render_svg_blocking(
 	src_bytes: Vec<u8>,
 	fontdb: Arc<usvg::fontdb::Database>,
@@ -109,7 +112,13 @@ pub(crate) async fn render_svg_blocking(
 	max_decode_pixels: u64,
 	timeout_ms: u64,
 ) -> Result<DynamicImage, ()> {
+	let decode_permit = crate::DECODE_SEMAPHORE
+		.clone()
+		.acquire_owned()
+		.await
+		.map_err(|_| ())?;
 	let task = tokio::task::spawn_blocking(move || {
+		let _decode_permit = decode_permit;
 		render_svg(&src_bytes, fontdb, size_hint, max_decode_pixels)
 	});
 	let abort_handle = task.abort_handle();

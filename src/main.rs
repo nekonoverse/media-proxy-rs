@@ -18,15 +18,26 @@ mod img;
 mod ssrf;
 mod svg;
 
-/// Bounds concurrent fetch+encode work so that per-request memory budgets
-/// (#4/#5) cannot be multiplied without limit (finding #6). Auth and
-/// per-client rate limiting remain deployment decisions (e.g. reverse proxy
-/// or network policy in front of this Misskey/Cherrypick media proxy).
+/// Global memory reservation unit and budget for buffered source, decoder
+/// output, and conversion copies. Requests acquire their worst-case cost
+/// before fetching, so `max_size` cannot be multiplied without bound.
+const MEMORY_PERMIT_BYTES: u64 = 1024 * 1024;
+const DEFAULT_MEMORY_BUDGET_PERMITS: u32 = 1024; // 1 GiB
+static MEMORY_BUDGET_PERMITS: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+	std::env::var("MEDIA_PROXY_MEMORY_BUDGET_MIB")
+		.ok()
+		.and_then(|s| s.parse().ok())
+		.filter(|n: &u32| *n > 0)
+		.unwrap_or(DEFAULT_MEMORY_BUDGET_PERMITS)
+});
 static FETCH_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
-	// A request retains its downloaded bytes while decoding and encoding. Keep
-	// this deliberately small: the byte limits in img.rs bound an individual
-	// decode, while this bounds the amount of such work that can coexist.
-	std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(4));
+	std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(*MEMORY_BUDGET_PERMITS));
+
+/// A timed-out `spawn_blocking` job cannot be preempted. Its permit is moved
+/// into the blocking closure, therefore it remains occupied until the actual
+/// decoder exits rather than being released when the HTTP request times out.
+pub(crate) static DECODE_SEMAPHORE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+	std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConfigFile {
@@ -35,6 +46,11 @@ pub struct ConfigFile {
 	user_agent: String,
 	max_size: u64,
 	proxy: Option<String>,
+	/// An HTTP proxy resolves CONNECT targets itself, bypassing this process's
+	/// connect-time SSRF check. Opt in only when that proxy enforces an
+	/// equivalent egress policy.
+	#[serde(default)]
+	unsafe_allow_proxy: bool,
 	filter_type: FilterType,
 	max_pixels: u32,
 	append_headers: Vec<String>,
@@ -45,7 +61,7 @@ pub struct ConfigFile {
 	blocked_networks: Option<Vec<String>>,
 	blocked_hosts: Option<Vec<String>>,
 	/// Octal permission bits for a `unix://` `bind_addr` socket, e.g. `"0660"`.
-	/// Defaults to `0666` (existing behavior) when unset.
+	/// Defaults to `0660` when unset.
 	unix_socket_permissions: Option<String>,
 }
 #[derive(Debug, Deserialize)]
@@ -133,6 +149,7 @@ fn main() {
 			user_agent: "https://github.com/yojo-art/media-proxy-rs".to_owned(),
 			max_size:256*1024*1024,
 			proxy:None,
+			unsafe_allow_proxy:false,
 			filter_type:FilterType::Triangle,
 			max_pixels:2048,
 			append_headers:[
@@ -192,7 +209,7 @@ fn main() {
 				std::process::exit(1);
 			}
 		},
-		None => 0o666,
+		None => 0o660,
 	};
 	let dummy_png = Arc::new(include_bytes!("../asset/dummy.png").to_vec());
 	let config = Arc::new(config);
@@ -203,6 +220,10 @@ fn main() {
 	let client = reqwest::ClientBuilder::new();
 	let client = match &config.proxy {
 		Some(url) => {
+			if !config.unsafe_allow_proxy {
+				eprintln!("refusing proxy configuration: set unsafe_allow_proxy=true only when the egress proxy enforces equivalent SSRF controls");
+				std::process::exit(1);
+			}
 			// See ssrf.rs module doc "Caveat": with an egress proxy configured, the
 			// proxy resolves and connects to the target, so ValidatingResolver's
 			// connect-time SSRF re-validation (DNS-rebinding protection) does not
@@ -273,6 +294,9 @@ fn main() {
 		// A single bad request must not kill the process (finding #3).
 		// With panic="abort" removed, this layer turns handler panics into 500s.
 		let app = app.layer(tower_http::catch_panic::CatchPanicLayer::new());
+		// Detailed diagnostics are logged server-side. Never expose decoder,
+		// DNS, or transport details through a response header.
+		let app = app.layer(axum::middleware::map_response(strip_internal_error));
 		// NOTE: handlers do not use ConnectInfo, so plain into_make_service()
 		// works for both TCP and UDS listeners.
 		match parse_bind_addr(&bind_addr) {
@@ -308,6 +332,11 @@ fn main() {
 			}
 		}
 	});
+}
+
+async fn strip_internal_error(mut response: axum::response::Response) -> axum::response::Response {
+	response.headers_mut().remove("X-Proxy-Error");
+	response
 }
 
 /// Where to listen, decided by `bind_addr`.
@@ -367,7 +396,7 @@ fn parse_unix_socket_mode(s: &str) -> Result<u32, String> {
 }
 
 /// Bind a UDS listener: create parent dirs, drop a stale socket file left by
-/// an unclean shutdown, then chmod to `mode` (default `0666`, configurable via
+/// an unclean shutdown, then chmod to `mode` (default `0660`, configurable via
 /// `unix_socket_permissions`) so a reverse proxy running as a different user
 /// can connect.
 #[cfg(unix)]
@@ -498,6 +527,24 @@ async fn get_file(
 		"check_url {}ms",
 		(chrono::Utc::now() - time).num_milliseconds()
 	);
+	// Reserve the buffered source plus three decoded-image-sized working
+	// buffers. This is conservative for normal images and is deliberately
+	// charged before downloading any attacker-controlled bytes.
+	let memory_bytes = config
+		.max_size
+		.saturating_add(config.max_size.saturating_div(4).saturating_mul(3));
+	let memory_permits_raw = memory_bytes
+		.saturating_add(MEMORY_PERMIT_BYTES - 1)
+		.saturating_div(MEMORY_PERMIT_BYTES);
+	if memory_permits_raw == 0 || memory_permits_raw > *MEMORY_BUDGET_PERMITS as u64 {
+		eprintln!(
+			"max_size {} exceeds the global memory budget",
+			config.max_size
+		);
+		headers.append("X-Proxy-Error", "ConfigurationLimit".parse().unwrap());
+		return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, headers).into_response());
+	}
+	let memory_permits = memory_permits_raw as u32;
 	// Bound concurrent work (finding #6). The permit is acquired only after
 	// URL validation so DNS resolution cannot occupy every permit (M-03) and
 	// is held through buffered fetch+encode so memory/CPU budgets cannot be
@@ -507,7 +554,7 @@ async fn get_file(
 	// timeout is what actually sheds load with 503 instead of queueing forever.
 	let _permit = match tokio::time::timeout(
 		std::time::Duration::from_secs(30),
-		FETCH_SEMAPHORE.acquire(),
+		FETCH_SEMAPHORE.acquire_many(memory_permits),
 	)
 	.await
 	{
@@ -570,27 +617,22 @@ async fn get_file(
 		};
 		// Resolve relative Location headers against the current URL, then
 		// re-validate every hop with check_url (finding #2).
-		let base = reqwest::Url::from_str(&current_url)
-			.map_err(|e| {
-				(
-					axum::http::StatusCode::BAD_REQUEST,
-					headers.clone(),
-					format!("{:?}", e),
-				)
-					.into_response()
-			})
-			.map_err(axum::response::Response::from)?;
-		let next = base
-			.join(&location)
-			.map_err(|e| {
-				(
-					axum::http::StatusCode::BAD_REQUEST,
-					headers.clone(),
-					format!("{:?}", e),
-				)
-					.into_response()
-			})
-			.map_err(axum::response::Response::from)?;
+		let base = match reqwest::Url::from_str(&current_url) {
+			Ok(base) => base,
+			Err(e) => {
+				eprintln!("invalid redirect base {:?}: {:?}", current_url, e);
+				headers.append("X-Proxy-Error", "InvalidRedirect".parse().unwrap());
+				return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
+			}
+		};
+		let next = match base.join(&location) {
+			Ok(next) => next,
+			Err(e) => {
+				eprintln!("invalid redirect location {:?}: {:?}", location, e);
+				headers.append("X-Proxy-Error", "InvalidRedirect".parse().unwrap());
+				return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
+			}
+		};
 		// Drain only a bounded prefix of the redirect body (H-02). Reading
 		// the whole body with `resp.bytes()` let an attacker buffer gigabytes
 		// per hop (no max_size check applies here).
@@ -877,11 +919,21 @@ impl RequestContext {
 			// same as SVG rendering (H-01): bound it with a deadline so a
 			// pathological image cannot occupy a blocking-pool thread
 			// indefinitely (code-review finding: this path had no timeout at
-			// all, unlike the SVG path). Same caveat as svg.rs's
-			// render_svg_blocking: abort() cannot preempt an already-running
-			// closure, but does stop one still queued on the blocking pool.
-			let task =
-				tokio::runtime::Handle::current().spawn_blocking(move || handle.encode_img());
+			// all, unlike the SVG path). `abort()` cannot preempt an already-
+			// running closure, but DECODE_SEMAPHORE stays held by that closure
+			// until it actually exits, preventing timed-out jobs from piling up.
+			let decode_permit = match DECODE_SEMAPHORE.clone().acquire_owned().await {
+				Ok(permit) => permit,
+				Err(_) => {
+					return Err(
+						(axum::http::StatusCode::SERVICE_UNAVAILABLE, header).into_response()
+					)
+				}
+			};
+			let task = tokio::runtime::Handle::current().spawn_blocking(move || {
+				let _decode_permit = decode_permit;
+				handle.encode_img()
+			});
 			let abort_handle = task.abort_handle();
 			let resp = match tokio::time::timeout(
 				std::time::Duration::from_millis(timeout_ms.max(1)),
@@ -1042,14 +1094,12 @@ impl RequestContext {
 					response_bytes.extend_from_slice(&b);
 				}
 				Err(e) => {
+					eprintln!("response body read failed: {:?}", e);
 					self.headers
-						.append("X-Proxy-Error", format!("LoadAll:{:?}", e).parse().unwrap());
-					return Err((
-						axum::http::StatusCode::BAD_GATEWAY,
-						self.headers.clone(),
-						format!("{:?}", e),
-					)
-						.into_response());
+						.append("X-Proxy-Error", "LoadFailed".parse().unwrap());
+					return Err(
+						(axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
+					);
 				}
 			}
 		}
