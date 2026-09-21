@@ -44,6 +44,11 @@ pub(crate) fn decode(
 	if !dimensions_allowed_for(max_decode_pixels, width as u64, height as u64) {
 		return Err(format!("DecodeDimensions {}x{} over limit", width, height));
 	}
+	// `create_sample_table` reserves one Indice for every sample implied by
+	// stsc/stco before it can validate the other sample tables.  Do this cheap
+	// consistency and size check first: otherwise a tiny file can claim an
+	// enormous samples_per_chunk and make mp4parse allocate gigabytes.
+	validate_sample_table_size(color_track, frames_limit)?;
 	let color_samples = mp4parse::unstable::create_sample_table(color_track, 0.into())
 		.ok_or_else(|| "NoSampleTable".to_owned())?;
 	let sample_count = if first_frame_only {
@@ -68,6 +73,9 @@ pub(crate) fn decode(
 		.find(|t| t.track_type == mp4parse::TrackType::AuxiliaryVideo);
 	let mut alpha_by_timestamp = std::collections::HashMap::new();
 	if let Some(track) = alpha_track {
+		// Alpha is a separate ISO-BMFF track and needs the same guard before
+		// constructing its table.
+		validate_sample_table_size(track, frames_limit)?;
 		let samples = mp4parse::unstable::create_sample_table(track, 0.into())
 			.ok_or_else(|| "NoAlphaSampleTable".to_owned())?;
 		let count = sample_count.min(samples.len());
@@ -112,6 +120,70 @@ pub(crate) fn decode(
 		return Err("NoAvailableFrames".to_owned());
 	}
 	Ok(Some(AvifSequence { frames }))
+}
+
+/// Verify the sample count that `mp4parse::create_sample_table` would derive
+/// without creating its per-sample allocation.  A valid AVIF track has the
+/// same number of samples in stsc, stsz, and stts; enforcing that invariant
+/// also prevents a forged stsc from amplifying a small input into a huge Vec.
+fn validate_sample_table_size(track: &mp4parse::Track, limit: u64) -> Result<(), String> {
+	let (stsc, stco, stsz, stts) = match (&track.stsc, &track.stco, &track.stsz, &track.stts) {
+		(Some(stsc), Some(stco), Some(stsz), Some(stts)) => (stsc, stco, stsz, stts),
+		_ => return Err("NoSampleTable".to_owned()),
+	};
+	let chunk_count = stco.offsets.len();
+	let entries = stsc.samples.as_slice();
+	if chunk_count == 0
+		|| entries.is_empty()
+		|| entries[0].first_chunk != 1
+		|| entries.iter().any(|entry| entry.first_chunk == 0)
+		|| entries
+			.windows(2)
+			.any(|pair| pair[0].first_chunk >= pair[1].first_chunk)
+	{
+		return Err("InvalidSampleTable".to_owned());
+	}
+
+	let mut implied = 0u64;
+	for (index, entry) in entries.iter().enumerate() {
+		let start = entry.first_chunk as usize - 1;
+		let end = entries
+			.get(index + 1)
+			.map(|next| next.first_chunk as usize - 1)
+			.unwrap_or(chunk_count);
+		if entry.samples_per_chunk == 0 || start >= chunk_count || end <= start || end > chunk_count
+		{
+			return Err("InvalidSampleTable".to_owned());
+		}
+		let samples = (end - start)
+			.checked_mul(entry.samples_per_chunk as usize)
+			.ok_or_else(|| "SampleTableOverflow".to_owned())? as u64;
+		implied = implied
+			.checked_add(samples)
+			.ok_or_else(|| "SampleTableOverflow".to_owned())?;
+		if implied > limit {
+			return Err(format!("FramesLimit {}>{}", implied, limit));
+		}
+	}
+
+	let stts_count = stts.samples.iter().try_fold(0u64, |total, sample| {
+		total.checked_add(sample.sample_count as u64)
+	});
+	if stts_count != Some(implied)
+		|| (stsz.sample_size == 0 && stsz.sample_sizes.len() as u64 != implied)
+	{
+		return Err("InconsistentSampleTable".to_owned());
+	}
+	if let Some(stss) = &track.stss {
+		if stss
+			.samples
+			.iter()
+			.any(|&sample| sample == 0 || sample as u64 > implied)
+		{
+			return Err("InconsistentSampleTable".to_owned());
+		}
+	}
+	Ok(())
 }
 
 fn video_size(track: &mp4parse::Track) -> Option<(u16, u16)> {
@@ -406,6 +478,38 @@ mod tests {
 	#[test]
 	fn avis_brand_is_detected() {
 		assert!(is_avif_sequence(b"\x00\x00\x00\x1cftypavis____"));
+	}
+	#[test]
+	fn sample_table_limit_is_checked_before_mp4parse_materializes_samples() {
+		let track = mp4parse::Track {
+			stsc: Some(mp4parse::SampleToChunkBox {
+				samples: vec![mp4parse::SampleToChunk {
+					first_chunk: 1,
+					samples_per_chunk: 100_000_000,
+					sample_description_index: 1,
+				}]
+				.into(),
+			}),
+			stco: Some(mp4parse::ChunkOffsetBox {
+				offsets: vec![0].into(),
+			}),
+			stsz: Some(mp4parse::SampleSizeBox {
+				sample_size: 1,
+				sample_sizes: Vec::new().into(),
+			}),
+			stts: Some(mp4parse::TimeToSampleBox {
+				samples: vec![mp4parse::Sample {
+					sample_count: 10,
+					sample_delta: 1,
+				}]
+				.into(),
+			}),
+			..Default::default()
+		};
+		assert!(matches!(
+			validate_sample_table_size(&track, 1000),
+			Err(ref error) if error.starts_with("FramesLimit")
+		));
 	}
 	#[test]
 	fn yuv_identity_full_range_is_gbr() {

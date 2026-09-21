@@ -390,10 +390,20 @@ impl RequestContext {
 				Err(_) => {}
 			}
 		}
-		if self.parms.r#static.is_some() {
+		// MNG and AVIF sequences have custom decoders which implement
+		// first_frame_only.  Let them handle static/badge requests too instead
+		// of sending these formats to image's unsupported single-image path.
+		let is_custom_animation = matches!(&self.codec, Ok(image::ImageFormat::Avif))
+			|| matches!(
+				self.headers
+					.get("Content-Type")
+					.and_then(|value| value.to_str().ok()),
+				Some("image/avif" | "image/x-mng")
+			);
+		if self.parms.r#static.is_some() && !is_custom_animation {
 			return self.encode_single();
 		}
-		if self.parms.badge.is_some() {
+		if self.parms.badge.is_some() && !is_custom_animation {
 			return self.encode_single();
 		}
 		let codec = match &self.codec {
