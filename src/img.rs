@@ -827,10 +827,19 @@ impl RequestContext {
 		) {
 			Ok(Some(seq)) => seq,
 			Ok(None) => {
-				return match image::load_from_memory_with_format(
-					&self.src_bytes,
+				// Keep this static-AVIF fallback under the same allocation budget
+				// as every other decode path. The convenience loader uses image's
+				// 512 MiB default limit, which can exceed this request's reservation.
+				let mut reader = image::ImageReader::with_format(
+					std::io::Cursor::new(&self.src_bytes),
 					image::ImageFormat::Avif,
-				) {
+				);
+				let mut limits = image::Limits::default();
+				limits.max_image_width = Some(32768);
+				limits.max_image_height = Some(32768);
+				limits.max_alloc = Some(self.max_decode_pixels().saturating_mul(4));
+				reader.limits(limits);
+				return match reader.decode() {
 					Ok(img) => self.response_img(img),
 					Err(e) => {
 						self.format_error_response(format!("DecodeError_{:?}", e), "AvifError")

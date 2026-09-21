@@ -358,7 +358,10 @@ pub(crate) fn is_ip_blocked(config: &ConfigFile, ip: IpAddr) -> bool {
 					return true;
 				}
 			}
-			if IPV4_BLOCKED_DEFAULT.contains(&v4) {
+			// RFC 3068's former 6to4 relay anycast range is special-use, not a
+			// valid public proxy destination.
+			let is_special_use = v4.octets()[0..3] == [192, 88, 99];
+			if IPV4_BLOCKED_DEFAULT.contains(&v4) || is_special_use {
 				if let Some(allowed) = config.allowed_networks.as_ref() {
 					if parse_v4_nets(allowed).contains(&v4) {
 						return false;
@@ -378,8 +381,20 @@ pub(crate) fn is_ip_blocked(config: &ConfigFile, ip: IpAddr) -> bool {
 			// Teredo (2001:0000::/32) can carry an IPv4 address and is never
 			// legitimate for this proxy; refuse it unconditionally (M-04).
 			let seg = v6.segments();
+			// Documentation and benchmarking prefixes, plus the deprecated 6to4
+			// relay range, must never be reachable through the proxy. Check before
+			// transition-address extraction so an embedded public IPv4 cannot make
+			// a documentation address appear routable.
+			let is_special_use = (seg[0] == 0x2001 && seg[1] == 0x0002 && seg[2] == 0)
+				|| (seg[0] == 0x2001 && seg[1] == 0x0db8);
 			if seg[0] == 0x2001 && seg[1] == 0x0000 {
 				return true;
+			}
+			if is_special_use {
+				return !config
+					.allowed_networks
+					.as_ref()
+					.is_some_and(|allowed| parse_v6_nets(allowed).contains(&v6));
 			}
 			// IPv4-mapped/-compatible/-translated, NAT64, 6to4: apply the
 			// IPv4 policy (M-04).
@@ -557,6 +572,7 @@ mod tests {
 			"169.254.169.254",
 			"100.64.0.1",
 			"0.0.0.0",
+			"192.88.99.1",
 		] {
 			assert!(is_ip_blocked(&c, v4(ip)), "{} should be blocked", ip);
 		}
@@ -568,6 +584,8 @@ mod tests {
 			"ff02::1",
 			"::ffff:127.0.0.1",
 			"::ffff:169.254.169.254",
+			"2001:2::1",
+			"2001:db8::1",
 		] {
 			assert!(is_ip_blocked(&c, v6(ip)), "{} should be blocked", ip);
 		}

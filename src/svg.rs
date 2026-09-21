@@ -3,6 +3,14 @@ use std::sync::Arc;
 use image::{DynamicImage, ImageBuffer};
 use resvg::usvg;
 
+/// A render may fail because its input is invalid, or because all decoding
+/// workers are still occupied by earlier non-preemptible blocking jobs.
+/// Keep those cases separate so callers can shed the latter with 503.
+pub(crate) enum RenderSvgError {
+	Unavailable,
+	Failed,
+}
+
 /// `href` resolution policy: data URIs only. The default `resolve_string`
 /// treats the href as a local file path and reads it with `std::fs::read`,
 /// so an attacker SVG could exfiltrate local files or read `/dev/zero`
@@ -111,23 +119,29 @@ pub(crate) async fn render_svg_blocking(
 	size_hint: (u32, u32),
 	max_decode_pixels: u64,
 	timeout_ms: u64,
-) -> Result<DynamicImage, ()> {
-	let decode_permit = crate::DECODE_SEMAPHORE
-		.clone()
-		.acquire_owned()
-		.await
-		.map_err(|_| ())?;
+) -> Result<DynamicImage, RenderSvgError> {
+	// A timed-out blocking render retains its permit until it really exits.
+	// Do not let later requests queue indefinitely behind those jobs.
+	let decode_permit = match tokio::time::timeout(
+		std::time::Duration::from_millis(timeout_ms.max(1)),
+		crate::DECODE_SEMAPHORE.clone().acquire_owned(),
+	)
+	.await
+	{
+		Ok(Ok(permit)) => permit,
+		Ok(Err(_)) | Err(_) => return Err(RenderSvgError::Unavailable),
+	};
 	let task = tokio::task::spawn_blocking(move || {
 		let _decode_permit = decode_permit;
 		render_svg(&src_bytes, fontdb, size_hint, max_decode_pixels)
 	});
 	let abort_handle = task.abort_handle();
 	match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms.max(1)), task).await {
-		Ok(Ok(result)) => result,
-		Ok(Err(_join_error)) => Err(()),
+		Ok(Ok(Ok(result))) => Ok(result),
+		Ok(Ok(Err(_))) | Ok(Err(_)) => Err(RenderSvgError::Failed),
 		Err(_elapsed) => {
 			abort_handle.abort();
-			Err(())
+			Err(RenderSvgError::Failed)
 		}
 	}
 }

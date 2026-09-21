@@ -976,7 +976,7 @@ impl RequestContext {
 			let size_hint = self.image_size_hint();
 			let max_decode_pixels = self.max_decode_pixels();
 			let timeout_ms = self.config.timeout;
-			if let Ok(img) = crate::svg::render_svg_blocking(
+			match crate::svg::render_svg_blocking(
 				src_bytes,
 				fontdb,
 				size_hint,
@@ -985,39 +985,50 @@ impl RequestContext {
 			)
 			.await
 			{
-				self.headers.remove("Content-Length");
-				self.headers.remove("Content-Range");
-				self.headers.remove("Accept-Ranges");
-				self.headers.remove("Cache-Control");
-				self.headers.append(
-					"Cache-Control",
-					"max-age=31536000, immutable".parse().unwrap(),
-				);
-				return Err(self.response_img(img));
-			} else {
-				// Never reflect the remote SVG bytes inline: serving attacker XML
-				// as image/svg+xml from the proxy origin is a stored-XSS vector
-				// (finding #7). Fail closed, or serve the dummy image when the
-				// caller asked for a fallback.
-				self.headers.remove("Content-Type");
-				self.headers.remove("Content-Length");
-				self.headers.remove("Content-Range");
-				self.headers.remove("Accept-Ranges");
-				if self.parms.fallback.is_some() {
-					self.headers
-						.append("Content-Type", "image/png".parse().unwrap());
-					return Err((
-						axum::http::StatusCode::OK,
-						self.headers.clone(),
-						(*self.dummy_img).clone(),
-					)
-						.into_response());
+				Ok(img) => {
+					self.headers.remove("Content-Length");
+					self.headers.remove("Content-Range");
+					self.headers.remove("Accept-Ranges");
+					self.headers.remove("Cache-Control");
+					self.headers.append(
+						"Cache-Control",
+						"max-age=31536000, immutable".parse().unwrap(),
+					);
+					return Err(self.response_img(img));
 				}
-				self.headers
-					.append("X-Proxy-Error", "SvgEncodeError".parse().unwrap());
-				return Err(
-					(axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
-				);
+				Err(svg_error) => {
+					// Never reflect the remote SVG bytes inline: serving attacker XML
+					// as image/svg+xml from the proxy origin is a stored-XSS vector
+					// (finding #7). Fail closed, or serve the dummy image when the
+					// caller asked for a fallback.
+					self.headers.remove("Content-Type");
+					self.headers.remove("Content-Length");
+					self.headers.remove("Content-Range");
+					self.headers.remove("Accept-Ranges");
+					if self.parms.fallback.is_some() {
+						self.headers
+							.append("Content-Type", "image/png".parse().unwrap());
+						return Err((
+							axum::http::StatusCode::OK,
+							self.headers.clone(),
+							(*self.dummy_img).clone(),
+						)
+							.into_response());
+					}
+					let status = match svg_error {
+						crate::svg::RenderSvgError::Unavailable => {
+							self.headers
+								.append("X-Proxy-Error", "DecodeBusy".parse().unwrap());
+							axum::http::StatusCode::SERVICE_UNAVAILABLE
+						}
+						crate::svg::RenderSvgError::Failed => {
+							self.headers
+								.append("X-Proxy-Error", "SvgEncodeError".parse().unwrap());
+							axum::http::StatusCode::BAD_GATEWAY
+						}
+					};
+					return Err((status, self.headers.clone()).into_response());
+				}
 			}
 		} else if is_img || self.codec.is_ok() {
 			self.headers.remove("Content-Length");
@@ -1036,9 +1047,14 @@ impl RequestContext {
 			// all, unlike the SVG path). `abort()` cannot preempt an already-
 			// running closure, but DECODE_SEMAPHORE stays held by that closure
 			// until it actually exits, preventing timed-out jobs from piling up.
-			let decode_permit = match DECODE_SEMAPHORE.clone().acquire_owned().await {
-				Ok(permit) => permit,
-				Err(_) => {
+			let decode_permit = match tokio::time::timeout(
+				std::time::Duration::from_millis(timeout_ms.max(1)),
+				DECODE_SEMAPHORE.clone().acquire_owned(),
+			)
+			.await
+			{
+				Ok(Ok(permit)) => permit,
+				Ok(Err(_)) | Err(_) => {
 					return Err(
 						(axum::http::StatusCode::SERVICE_UNAVAILABLE, header).into_response()
 					)
