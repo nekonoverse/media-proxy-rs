@@ -34,7 +34,7 @@ static MEMORY_BUDGET_PERMITS: std::sync::LazyLock<u32> = std::sync::LazyLock::ne
 		.unwrap_or(DEFAULT_MEMORY_BUDGET_PERMITS)
 });
 static FETCH_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
-	std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(*MEMORY_BUDGET_PERMITS));
+	std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(*MEMORY_BUDGET_PERMITS as usize));
 
 /// A timed-out `spawn_blocking` job cannot be preempted. Its permit is moved
 /// into the blocking closure, therefore it remains occupied until the actual
@@ -479,6 +479,11 @@ impl CheckUrlError {
 			CheckUrlError::PolicyDenied => "PolicyDenied",
 			CheckUrlError::ResolveFailed => "ResolveFailed",
 		}
+	}
+}
+impl std::fmt::Display for CheckUrlError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(self.as_header())
 	}
 }
 async fn check_url(config: &Arc<ConfigFile>, url: impl AsRef<str>) -> Result<(), CheckUrlError> {
