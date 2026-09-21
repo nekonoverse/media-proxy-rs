@@ -33,15 +33,31 @@ COPY asset ./asset
 COPY examples ./examples
 RUN --mount=type=cache,target=/var/cache/cargo --mount=type=cache,target=/app/target bash /app/crossfiles/build.sh
 
-FROM public.ecr.aws/docker/library/alpine:latest
-ARG UID="852"
-ARG GID="852"
-RUN addgroup -g "${GID}" proxy && adduser -u "${UID}" -G proxy -D -h /media-proxy-rs -s /bin/sh proxy
+# Distroless has neither a shell nor package manager. Exercise the binary in
+# an Alpine-only build stage, then copy only the static executables into the
+# runtime image.
+FROM public.ecr.aws/docker/library/alpine:latest AS smoke_test
+RUN addgroup -g 65532 nonroot && adduser -u 65532 -G nonroot -D -h /test nonroot
+WORKDIR /test
+COPY --from=build_app --chown=65532:65532 /app/media-proxy-rs ./media-proxy-rs
+COPY --from=build_app --chown=65532:65532 /app/healthcheck ./healthcheck
+USER 65532:65532
+RUN ./media-proxy-rs & pid=$!; \
+	for _ in $(seq 1 30); do ./healthcheck http://127.0.0.1:12766/healthz && kill "$pid" && touch /test/passed && exit 0; sleep 1; done; \
+	kill "$pid" 2>/dev/null || true; exit 1
+
+# Stage the writable workdir with the UID used by distroless:nonroot. This is
+# necessary because the proxy creates config.json on first startup.
+FROM cross_build AS runtime_home
+RUN mkdir -p /rootfs/media-proxy-rs && chown 65532:65532 /rootfs/media-proxy-rs
+COPY --from=build_app --chown=65532:65532 /app/media-proxy-rs /rootfs/media-proxy-rs/media-proxy-rs
+COPY --from=build_app --chown=65532:65532 /app/healthcheck /rootfs/media-proxy-rs/healthcheck
+
+FROM gcr.io/distroless/static-debian13:nonroot
+COPY --from=runtime_home /rootfs/ /
+COPY --from=smoke_test /test/passed /etc/smoke-passed
 WORKDIR /media-proxy-rs
-USER proxy
-COPY --from=build_app /app/media-proxy-rs ./media-proxy-rs
-COPY --from=build_app /app/healthcheck ./healthcheck
-RUN sh -c "./media-proxy-rs&" && for i in $(seq 1 30); do ./healthcheck && exit 0; sleep 1; done; exit 1
-HEALTHCHECK --interval=30s --timeout=3s --start-period=15s CMD ./healthcheck || exit 1
+USER nonroot:nonroot
+HEALTHCHECK --interval=30s --timeout=3s --start-period=15s CMD ["./healthcheck"]
 EXPOSE 12766
 CMD ["./media-proxy-rs"]
